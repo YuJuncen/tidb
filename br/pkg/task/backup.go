@@ -1,0 +1,461 @@
+// Copyright 2020 PingCAP, Inc. Licensed under Apache-2.0.
+
+package task
+
+import (
+	"context"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/docker/go-units"
+	"github.com/opentracing/opentracing-go"
+	"github.com/pingcap/errors"
+	backuppb "github.com/pingcap/kvproto/pkg/backup"
+	"github.com/pingcap/log"
+	"github.com/pingcap/parser/model"
+	"github.com/pingcap/parser/mysql"
+	"github.com/pingcap/tidb/sessionctx/stmtctx"
+	"github.com/pingcap/tidb/sessionctx/variable"
+	"github.com/pingcap/tidb/statistics/handle"
+	"github.com/pingcap/tidb/types"
+	"github.com/spf13/pflag"
+	"go.uber.org/zap"
+
+	"github.com/pingcap/br/pkg/backup"
+	berrors "github.com/pingcap/br/pkg/errors"
+	"github.com/pingcap/br/pkg/glue"
+	"github.com/pingcap/br/pkg/logutil"
+	"github.com/pingcap/br/pkg/storage"
+	"github.com/pingcap/br/pkg/summary"
+	"github.com/pingcap/br/pkg/utils"
+)
+
+const (
+	flagBackupTimeago    = "timeago"
+	flagBackupTS         = "backupts"
+	flagLastBackupTS     = "lastbackupts"
+	flagCompressionType  = "compression"
+	flagCompressionLevel = "compression-level"
+	flagRemoveSchedulers = "remove-schedulers"
+	flagIgnoreStats      = "ignore-stats"
+
+	flagGCTTL = "gcttl"
+
+	defaultBackupConcurrency = 4
+	maxBackupConcurrency     = 256
+)
+
+// CompressionConfig is the configuration for sst file compression.
+type CompressionConfig struct {
+	CompressionType  backuppb.CompressionType `json:"compression-type" toml:"compression-type"`
+	CompressionLevel int32                    `json:"compression-level" toml:"compression-level"`
+}
+
+// BackupConfig is the configuration specific for backup tasks.
+type BackupConfig struct {
+	Config
+
+	TimeAgo          time.Duration `json:"time-ago" toml:"time-ago"`
+	BackupTS         uint64        `json:"backup-ts" toml:"backup-ts"`
+	LastBackupTS     uint64        `json:"last-backup-ts" toml:"last-backup-ts"`
+	GCTTL            int64         `json:"gc-ttl" toml:"gc-ttl"`
+	RemoveSchedulers bool          `json:"remove-schedulers" toml:"remove-schedulers"`
+	IgnoreStats      bool          `json:"ignore-stats" toml:"ignore-stats"`
+	CompressionConfig
+}
+
+// DefineBackupFlags defines common flags for the backup command.
+func DefineBackupFlags(flags *pflag.FlagSet) {
+	flags.Duration(
+		flagBackupTimeago, 0,
+		"The history version of the backup task, e.g. 1m, 1h. Do not exceed GCSafePoint")
+
+	// TODO: remove experimental tag if it's stable
+	flags.Uint64(flagLastBackupTS, 0, "(experimental) the last time backup ts,"+
+		" use for incremental backup, support TSO only")
+	flags.String(flagBackupTS, "", "the backup ts support TSO or datetime,"+
+		" e.g. '400036290571534337', '2018-05-11 01:42:23'")
+	flags.Int64(flagGCTTL, utils.DefaultBRGCSafePointTTL, "the TTL (in seconds) that PD holds for BR's GC safepoint")
+	flags.String(flagCompressionType, "zstd",
+		"backup sst file compression algorithm, value can be one of 'lz4|zstd|snappy'")
+	flags.Int32(flagCompressionLevel, 0, "compression level used for sst file compression")
+
+	flags.Bool(flagRemoveSchedulers, false,
+		"disable the balance, shuffle and region-merge schedulers in PD to speed up backup")
+	// This flag can impact the online cluster, so hide it in case of abuse.
+	_ = flags.MarkHidden(flagRemoveSchedulers)
+
+	// Disable stats by default. because of
+	// 1. DumpStatsToJson is not stable
+	// 2. It increases memory usage and might cause BR OOM.
+	// TODO: we need a better way to backup/restore stats.
+	flags.Bool(flagIgnoreStats, true, "ignore backup stats, used for test")
+	// This flag is used for test. we should backup stats all the time.
+	_ = flags.MarkHidden(flagIgnoreStats)
+}
+
+// ParseFromFlags parses the backup-related flags from the flag set.
+func (cfg *BackupConfig) ParseFromFlags(flags *pflag.FlagSet) error {
+	timeAgo, err := flags.GetDuration(flagBackupTimeago)
+	if err != nil {
+		return errors.Trace(err)
+	}
+	if timeAgo < 0 {
+		return errors.Annotate(berrors.ErrInvalidArgument, "negative timeago is not allowed")
+	}
+	cfg.TimeAgo = timeAgo
+	cfg.LastBackupTS, err = flags.GetUint64(flagLastBackupTS)
+	if err != nil {
+		return errors.Trace(err)
+	}
+	backupTS, err := flags.GetString(flagBackupTS)
+	if err != nil {
+		return errors.Trace(err)
+	}
+	cfg.BackupTS, err = parseTSString(backupTS)
+	if err != nil {
+		return errors.Trace(err)
+	}
+	gcTTL, err := flags.GetInt64(flagGCTTL)
+	if err != nil {
+		return errors.Trace(err)
+	}
+	cfg.GCTTL = gcTTL
+
+	compressionCfg, err := parseCompressionFlags(flags)
+	if err != nil {
+		return errors.Trace(err)
+	}
+	cfg.CompressionConfig = *compressionCfg
+
+	if err = cfg.Config.ParseFromFlags(flags); err != nil {
+		return errors.Trace(err)
+	}
+	cfg.RemoveSchedulers, err = flags.GetBool(flagRemoveSchedulers)
+	if err != nil {
+		return errors.Trace(err)
+	}
+	cfg.IgnoreStats, err = flags.GetBool(flagIgnoreStats)
+	return errors.Trace(err)
+}
+
+// ParseFromFlags parses the backup-related flags from the flag set.
+func parseCompressionFlags(flags *pflag.FlagSet) (*CompressionConfig, error) {
+	compressionStr, err := flags.GetString(flagCompressionType)
+	if err != nil {
+		return nil, errors.Trace(err)
+	}
+	compressionType, err := parseCompressionType(compressionStr)
+	if err != nil {
+		return nil, errors.Trace(err)
+	}
+	level, err := flags.GetInt32(flagCompressionLevel)
+	if err != nil {
+		return nil, errors.Trace(err)
+	}
+	return &CompressionConfig{
+		CompressionLevel: level,
+		CompressionType:  compressionType,
+	}, nil
+}
+
+// adjustBackupConfig is use for BR(binary) and BR in TiDB.
+// When new config was add and not included in parser.
+// we should set proper value in this function.
+// so that both binary and TiDB will use same default value.
+func (cfg *BackupConfig) adjustBackupConfig() {
+	cfg.adjust()
+	usingDefaultConcurrency := false
+	if cfg.Config.Concurrency == 0 {
+		cfg.Config.Concurrency = defaultBackupConcurrency
+		usingDefaultConcurrency = true
+	}
+	if cfg.Config.Concurrency > maxBackupConcurrency {
+		cfg.Config.Concurrency = maxBackupConcurrency
+	}
+	if cfg.RateLimit != unlimited {
+		// TiKV limits the upload rate by each backup request.
+		// When the backup requests are sent concurrently,
+		// the ratelimit couldn't work as intended.
+		// Degenerating to sequentially sending backup requests to avoid this.
+		if !usingDefaultConcurrency {
+			logutil.WarnTerm("setting `--ratelimit` and `--concurrency` at the same time, "+
+				"ignoring `--concurrency`: `--ratelimit` forces sequential (i.e. concurrency = 1) backup",
+				zap.String("ratelimit", units.HumanSize(float64(cfg.RateLimit))+"/s"),
+				zap.Uint32("concurrency-specified", cfg.Config.Concurrency))
+		}
+		cfg.Config.Concurrency = 1
+	}
+
+	if cfg.GCTTL == 0 {
+		cfg.GCTTL = utils.DefaultBRGCSafePointTTL
+	}
+	// Use zstd as default
+	if cfg.CompressionType == backuppb.CompressionType_UNKNOWN {
+		cfg.CompressionType = backuppb.CompressionType_ZSTD
+	}
+}
+
+// RunBackup starts a backup task inside the current goroutine.
+func RunBackup(c context.Context, g glue.Glue, cmdName string, cfg *BackupConfig) error {
+	cfg.adjustBackupConfig()
+
+	defer summary.Summary(cmdName)
+	ctx, cancel := context.WithCancel(c)
+	defer cancel()
+
+	if span := opentracing.SpanFromContext(ctx); span != nil && span.Tracer() != nil {
+		span1 := span.Tracer().StartSpan("task.RunBackup", opentracing.ChildOf(span.Context()))
+		defer span1.Finish()
+		ctx = opentracing.ContextWithSpan(ctx, span1)
+	}
+
+	u, err := storage.ParseBackend(cfg.Storage, &cfg.BackendOptions)
+	if err != nil {
+		return errors.Trace(err)
+	}
+	skipStats := cfg.IgnoreStats
+	// For backup, Domain is not needed if user ignores stats.
+	// Domain loads all table info into memory. By skipping Domain, we save
+	// lots of memory (about 500MB for 40K 40 fields YCSB tables).
+	needDomain := !skipStats
+	mgr, err := NewMgr(ctx, g, cfg.PD, cfg.TLS, GetKeepalive(&cfg.Config), cfg.CheckRequirements, needDomain)
+	if err != nil {
+		return errors.Trace(err)
+	}
+	defer mgr.Close()
+	var statsHandle *handle.Handle
+	if !skipStats {
+		statsHandle = mgr.GetDomain().StatsHandle()
+	}
+
+	client, err := backup.NewBackupClient(ctx, mgr)
+	if err != nil {
+		return errors.Trace(err)
+	}
+	opts := storage.ExternalStorageOptions{
+		NoCredentials:   cfg.NoCreds,
+		SendCredentials: cfg.SendCreds,
+		SkipCheckPath:   cfg.SkipCheckPath,
+	}
+	if err = client.SetStorage(ctx, u, &opts); err != nil {
+		return errors.Trace(err)
+	}
+	err = client.SetLockFile(ctx)
+	if err != nil {
+		return errors.Trace(err)
+	}
+	client.SetGCTTL(cfg.GCTTL)
+
+	backupTS, err := client.GetTS(ctx, cfg.TimeAgo, cfg.BackupTS)
+	if err != nil {
+		return errors.Trace(err)
+	}
+	g.Record("BackupTS", backupTS)
+	sp := utils.BRServiceSafePoint{
+		BackupTS: backupTS,
+		TTL:      client.GetGCTTL(),
+		ID:       utils.MakeSafePointID(),
+	}
+	// use lastBackupTS as safePoint if exists
+	if cfg.LastBackupTS > 0 {
+		sp.BackupTS = cfg.LastBackupTS
+	}
+
+	log.Info("current backup safePoint job", zap.Object("safePoint", sp))
+	err = utils.StartServiceSafePointKeeper(ctx, mgr.GetPDClient(), sp)
+	if err != nil {
+		return errors.Trace(err)
+	}
+
+	isIncrementalBackup := cfg.LastBackupTS > 0
+
+	if cfg.RemoveSchedulers {
+		log.Debug("removing some PD schedulers")
+		restore, e := mgr.RemoveSchedulers(ctx)
+		defer func() {
+			if ctx.Err() != nil {
+				log.Warn("context canceled, doing clean work with background context")
+				ctx = context.Background()
+			}
+			if restoreE := restore(ctx); restoreE != nil {
+				log.Warn("failed to restore removed schedulers, you may need to restore them manually", zap.Error(restoreE))
+			}
+		}()
+		if e != nil {
+			return errors.Trace(err)
+		}
+	}
+
+	req := backuppb.BackupRequest{
+		ClusterId:        client.GetClusterID(),
+		StartVersion:     cfg.LastBackupTS,
+		EndVersion:       backupTS,
+		RateLimit:        cfg.RateLimit,
+		Concurrency:      defaultBackupConcurrency,
+		CompressionType:  cfg.CompressionType,
+		CompressionLevel: cfg.CompressionLevel,
+	}
+	brVersion := g.GetVersion()
+	clusterVersion, err := mgr.GetClusterVersion(ctx)
+	if err != nil {
+		return errors.Trace(err)
+	}
+
+	ranges, schemas, err := backup.BuildBackupRangeAndSchema(mgr.GetStorage(), cfg.TableFilter, backupTS)
+	if err != nil {
+		return errors.Trace(err)
+	}
+	// nothing to backup
+	if ranges == nil {
+		backupMeta, err2 := backup.BuildBackupMeta(&req, nil, nil, nil, clusterVersion, brVersion)
+		if err2 != nil {
+			return errors.Trace(err2)
+		}
+		pdAddress := strings.Join(cfg.PD, ",")
+		log.Warn("Nothing to backup, maybe connected to cluster for restoring",
+			zap.String("PD address", pdAddress))
+		return client.SaveBackupMeta(ctx, &backupMeta)
+	}
+
+	ddlJobs := make([]*model.Job, 0)
+	if isIncrementalBackup {
+		if backupTS <= cfg.LastBackupTS {
+			log.Error("LastBackupTS is larger or equal to current TS")
+			return errors.Annotate(berrors.ErrInvalidArgument, "LastBackupTS is larger or equal to current TS")
+		}
+		err = utils.CheckGCSafePoint(ctx, mgr.GetPDClient(), cfg.LastBackupTS)
+		if err != nil {
+			log.Error("Check gc safepoint for last backup ts failed", zap.Error(err))
+			return errors.Trace(err)
+		}
+		ddlJobs, err = backup.GetBackupDDLJobs(mgr.GetStorage(), cfg.LastBackupTS, backupTS)
+		if err != nil {
+			return errors.Trace(err)
+		}
+	}
+
+	// The number of regions need to backup
+	approximateRegions := 0
+	for _, r := range ranges {
+		var regionCount int
+		regionCount, err = mgr.GetRegionCount(ctx, r.StartKey, r.EndKey)
+		if err != nil {
+			return errors.Trace(err)
+		}
+		approximateRegions += regionCount
+	}
+
+	summary.CollectInt("backup total regions", approximateRegions)
+
+	// Backup
+	// Redirect to log if there is no log file to avoid unreadable output.
+	updateCh := g.StartProgress(
+		ctx, cmdName, int64(approximateRegions), !cfg.LogProgress)
+
+	files, err := client.BackupRanges(ctx, ranges, req, uint(cfg.Concurrency), updateCh)
+	if err != nil {
+		return errors.Trace(err)
+	}
+	// Backup has finished
+	updateCh.Close()
+
+	backupMeta, err := backup.BuildBackupMeta(&req, files, nil, ddlJobs, clusterVersion, brVersion)
+	if err != nil {
+		return errors.Trace(err)
+	}
+
+	skipChecksum := !cfg.Checksum || isIncrementalBackup
+	checksumProgress := int64(schemas.Len())
+	if skipChecksum {
+		checksumProgress = 1
+		if isIncrementalBackup {
+			// Since we don't support checksum for incremental data, fast checksum should be skipped.
+			log.Info("Skip fast checksum in incremental backup")
+		} else {
+			// When user specified not to calculate checksum, don't calculate checksum.
+			log.Info("Skip fast checksum")
+		}
+	}
+	updateCh = g.StartProgress(ctx, "Checksum", checksumProgress, !cfg.LogProgress)
+	schemasConcurrency := uint(utils.MinInt(backup.DefaultSchemaConcurrency, schemas.Len()))
+	backupMeta.Schemas, err = schemas.BackupSchemas(
+		ctx, mgr.GetStorage(), statsHandle, backupTS, schemasConcurrency, cfg.ChecksumConcurrency, skipChecksum, updateCh)
+	if err != nil {
+		return errors.Trace(err)
+	}
+	// Checksum has finished, close checksum progress.
+	updateCh.Close()
+	if !skipChecksum {
+		// Check if checksum from files matches checksum from coprocessor.
+		err = checkChecksums(&backupMeta)
+		if err != nil {
+			return errors.Trace(err)
+		}
+	}
+
+	err = client.SaveBackupMeta(ctx, &backupMeta)
+	if err != nil {
+		return errors.Trace(err)
+	}
+
+	g.Record("Size", utils.ArchiveSize(&backupMeta))
+
+	// Set task summary to success status.
+	summary.SetSuccessStatus(true)
+	return nil
+}
+
+// checkChecksums checks the checksum of the client, once failed,
+// returning a error with message: "mismatched checksum".
+func checkChecksums(backupMeta *backuppb.BackupMeta) error {
+	checksums, err := backup.CollectChecksums(backupMeta)
+	if err != nil {
+		return errors.Trace(err)
+	}
+	err = backup.ChecksumMatches(backupMeta, checksums)
+	if err != nil {
+		return errors.Trace(err)
+	}
+	return nil
+}
+
+// parseTSString port from tidb setSnapshotTS.
+func parseTSString(ts string) (uint64, error) {
+	if len(ts) == 0 {
+		return 0, nil
+	}
+	if tso, err := strconv.ParseUint(ts, 10, 64); err == nil {
+		return tso, nil
+	}
+
+	loc := time.Local
+	sc := &stmtctx.StatementContext{
+		TimeZone: loc,
+	}
+	t, err := types.ParseTime(sc, ts, mysql.TypeTimestamp, types.MaxFsp)
+	if err != nil {
+		return 0, errors.Trace(err)
+	}
+	t1, err := t.GoTime(loc)
+	if err != nil {
+		return 0, errors.Trace(err)
+	}
+	return variable.GoTimeToTS(t1), nil
+}
+
+func parseCompressionType(s string) (backuppb.CompressionType, error) {
+	var ct backuppb.CompressionType
+	switch s {
+	case "lz4":
+		ct = backuppb.CompressionType_LZ4
+	case "snappy":
+		ct = backuppb.CompressionType_SNAPPY
+	case "zstd":
+		ct = backuppb.CompressionType_ZSTD
+	default:
+		return backuppb.CompressionType_UNKNOWN, errors.Annotatef(berrors.ErrInvalidArgument, "invalid compression type '%s'", s)
+	}
+	return ct, nil
+}
