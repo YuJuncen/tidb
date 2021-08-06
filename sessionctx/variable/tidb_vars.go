@@ -15,6 +15,7 @@ package variable
 
 import (
 	"math"
+	"time"
 
 	"github.com/pingcap/parser/mysql"
 	"github.com/pingcap/tidb/config"
@@ -583,6 +584,10 @@ const (
 
 	// TiDBEnableOrderedResultMode indicates if stabilize query results.
 	TiDBEnableOrderedResultMode = "tidb_enable_ordered_result_mode"
+
+	// TiDBEnableBulkDDLMode indicates if TiDB need to reduce the interval of checking info schema diff,
+	// for speeding up CREATE TABLE statments. This would consume more network bindwidth, enable it only when importing.
+	TiDBEnableBulkDDLMode = "tidb_enable_bulk_ddl_mode"
 )
 
 // TiDB vars that have only global scope
@@ -778,6 +783,9 @@ var (
 	}
 	EnableLocalTxn     = atomic.NewBool(DefTiDBEnableLocalTxn)
 	RestrictedReadOnly = atomic.NewBool(DefTiDBRestrictedReadOnly)
+
+	FirstWaitInfoSchemaSyncTime = atomic.NewDuration(50 * time.Millisecond)
+	WaitInfoSchemaSyncInterval  = atomic.NewDuration(20 * time.Millisecond)
 )
 
 // TopSQL is the variable for control top sql feature.

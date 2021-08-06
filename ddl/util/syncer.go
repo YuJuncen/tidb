@@ -51,7 +51,6 @@ const (
 	putKeyRetryUnlimited = math.MaxInt64
 	keyOpDefaultTimeout  = 2 * time.Second
 	keyOpRetryInterval   = 30 * time.Millisecond
-	checkVersInterval    = 20 * time.Millisecond
 
 	ddlPrompt = "ddl-syncer"
 )
@@ -59,7 +58,9 @@ const (
 var (
 	// CheckVersFirstWaitTime is a waitting time before the owner checks all the servers of the schema version,
 	// and it's an exported variable for testing.
-	CheckVersFirstWaitTime = 50 * time.Millisecond
+	CheckVersFirstWaitTime = int64(50 * time.Millisecond)
+	// CheckVersInterval is the interval between two checkings to all the servers of the schema version by the owner.
+	CheckVersInterval = int64(20 * time.Millisecond)
 	// SyncerSessionTTL is the etcd session's TTL in seconds.
 	// and it's an exported variable for testing.
 	SyncerSessionTTL = 90
@@ -115,10 +116,16 @@ type schemaVersionSyncer struct {
 	notifyCleanExpiredPathsCh chan struct{}
 	ctx                       context.Context
 	cancel                    context.CancelFunc
+	waitTime                  WaitSyncConfig
+}
+
+type WaitSyncConfig interface {
+	FisrtTime() time.Duration
+	Interval() time.Duration
 }
 
 // NewSchemaSyncer creates a new SchemaSyncer.
-func NewSchemaSyncer(ctx context.Context, etcdCli *clientv3.Client, id string, oc ownerChecker) SchemaSyncer {
+func NewSchemaSyncer(ctx context.Context, etcdCli *clientv3.Client, id string, oc ownerChecker, conf WaitSyncConfig) SchemaSyncer {
 	childCtx, cancelFunc := context.WithCancel(ctx)
 	return &schemaVersionSyncer{
 		etcdCli:                   etcdCli,
@@ -127,6 +134,7 @@ func NewSchemaSyncer(ctx context.Context, etcdCli *clientv3.Client, id string, o
 		notifyCleanExpiredPathsCh: make(chan struct{}, 1),
 		ctx:                       childCtx,
 		cancel:                    cancelFunc,
+		waitTime:                  conf,
 	}
 }
 
@@ -360,8 +368,9 @@ func isContextDone(ctx context.Context) bool {
 // OwnerCheckAllVersions implements SchemaSyncer.OwnerCheckAllVersions interface.
 func (s *schemaVersionSyncer) OwnerCheckAllVersions(ctx context.Context, latestVer int64) error {
 	startTime := time.Now()
-	time.Sleep(CheckVersFirstWaitTime)
+	time.Sleep(s.waitTime.FisrtTime())
 	notMatchVerCnt := 0
+	checkVersInterval := s.waitTime.Interval()
 	intervalCnt := int(time.Second / checkVersInterval)
 	updatedMap := make(map[string]struct{})
 

@@ -278,7 +278,7 @@ func newDDL(ctx context.Context, options ...Option) *ddl {
 		syncer = NewMockSchemaSyncer()
 	} else {
 		manager = owner.NewOwnerManager(ctx, etcdCli, ddlPrompt, id, DDLOwnerKey)
-		syncer = util.NewSchemaSyncer(ctx, etcdCli, id, manager)
+		syncer = util.NewSchemaSyncer(ctx, etcdCli, id, manager, opt.WaitConfig)
 		deadLockCkr = util.NewDeadTableLockChecker(etcdCli)
 	}
 
@@ -341,7 +341,6 @@ func (d *ddl) newDeleteRangeManager(mock bool) delRangeManager {
 func (d *ddl) Start(ctxPool *pools.ResourcePool) error {
 	logutil.BgLogger().Info("[ddl] start DDL", zap.String("ID", d.uuid), zap.Bool("runWorker", RunWorker))
 	d.ctx, d.cancel = context.WithCancel(d.ctx)
-
 	d.wg.Add(1)
 	go d.limitDDLJobs()
 

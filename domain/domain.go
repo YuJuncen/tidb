@@ -713,6 +713,7 @@ func (do *Domain) Init(ddlLease time.Duration, sysFactory func(*Domain) (pools.R
 		ddl.WithInfoCache(do.infoCache),
 		ddl.WithHook(callback),
 		ddl.WithLease(ddlLease),
+		ddl.WithGlobalVarWaitConfig(),
 	)
 	err = do.ddl.Start(sysCtxPool)
 	if err != nil {

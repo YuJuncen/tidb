@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"strconv"
 	"sync"
+	"time"
 
 	"github.com/pingcap/tidb/sessionctx"
 	"github.com/pingcap/tidb/sessionctx/variable"
@@ -159,6 +160,14 @@ func (svc *SysVarCache) RebuildSysVarCache(ctx sessionctx.Context) error {
 func checkEnableServerGlobalVar(name, sVal string) {
 	var err error
 	switch name {
+	case variable.TiDBEnableBulkDDLMode:
+		if variable.TiDBOptOn(sVal) {
+			variable.WaitInfoSchemaSyncInterval.Store(2 * time.Millisecond)
+			variable.FirstWaitInfoSchemaSyncTime.Store(3 * time.Microsecond)
+		} else {
+			variable.WaitInfoSchemaSyncInterval.Store(20 * time.Millisecond)
+			variable.FirstWaitInfoSchemaSyncTime.Store(50 * time.Microsecond)
+		}
 	case variable.TiDBEnableLocalTxn:
 		variable.EnableLocalTxn.Store(variable.TiDBOptOn(sVal))
 	case variable.TiDBEnableStmtSummary:

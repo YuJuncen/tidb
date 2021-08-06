@@ -1786,6 +1786,8 @@ var defaultSysVars = []*SysVar{
 		s.EnableStableResultMode = TiDBOptOn(val)
 		return nil
 	}},
+
+	{Scope: ScopeGlobal, Name: TiDBEnableBulkDDLMode, Value: Off, Type: TypeBool},
 }
 
 // FeedbackProbability points to the FeedbackProbability in statistics package.
