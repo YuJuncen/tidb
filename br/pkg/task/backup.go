@@ -43,6 +43,7 @@ const (
 	flagRemoveSchedulers = "remove-schedulers"
 	flagIgnoreStats      = "ignore-stats"
 	flagUseBackupMetaV2  = "use-backupmeta-v2"
+	flagKVConcurrency    = "kv-concurrency"
 
 	flagGCTTL = "gcttl"
 
@@ -67,6 +68,7 @@ type BackupConfig struct {
 	RemoveSchedulers bool          `json:"remove-schedulers" toml:"remove-schedulers"`
 	IgnoreStats      bool          `json:"ignore-stats" toml:"ignore-stats"`
 	UseBackupMetaV2  bool          `json:"use-backupmeta-v2"`
+	KVConcurrency    uint64        `json:"kv-concurrency" toml:"kv-concurrency"`
 	CompressionConfig
 }
 
@@ -85,6 +87,7 @@ func DefineBackupFlags(flags *pflag.FlagSet) {
 	flags.String(flagCompressionType, "zstd",
 		"backup sst file compression algorithm, value can be one of 'lz4|zstd|snappy'")
 	flags.Int32(flagCompressionLevel, 0, "compression level used for sst file compression")
+	flags.Uint64(flagKVConcurrency, 4, "the count of CPU core would be used for backing up in TiKV.")
 
 	flags.Bool(flagRemoveSchedulers, false,
 		"disable the balance, shuffle and region-merge schedulers in PD to speed up backup")
@@ -157,7 +160,14 @@ func (cfg *BackupConfig) ParseFromFlags(flags *pflag.FlagSet) error {
 		return errors.Trace(err)
 	}
 	cfg.UseBackupMetaV2, err = flags.GetBool(flagUseBackupMetaV2)
-	return errors.Trace(err)
+	if err != nil {
+		return errors.Trace(err)
+	}
+	cfg.KVConcurrency, err = flags.GetUint64(flagKVConcurrency)
+	if err != nil {
+		return errors.Trace(err)
+	}
+	return nil
 }
 
 // parseCompressionFlags parses the backup-related flags from the flag set.
@@ -190,6 +200,9 @@ func (cfg *BackupConfig) adjustBackupConfig() {
 	if cfg.Config.Concurrency == 0 {
 		cfg.Config.Concurrency = defaultBackupConcurrency
 		usingDefaultConcurrency = true
+	}
+	if cfg.KVConcurrency == 0 {
+		cfg.KVConcurrency = defaultBackupConcurrency
 	}
 	if cfg.Config.Concurrency > maxBackupConcurrency {
 		cfg.Config.Concurrency = maxBackupConcurrency
@@ -313,7 +326,7 @@ func RunBackup(c context.Context, g glue.Glue, cmdName string, cfg *BackupConfig
 		StartVersion:     cfg.LastBackupTS,
 		EndVersion:       backupTS,
 		RateLimit:        cfg.RateLimit,
-		Concurrency:      defaultBackupConcurrency,
+		Concurrency:      uint32(cfg.KVConcurrency),
 		CompressionType:  cfg.CompressionType,
 		CompressionLevel: cfg.CompressionLevel,
 	}
