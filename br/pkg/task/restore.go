@@ -4,6 +4,7 @@ package task
 
 import (
 	"context"
+	"math"
 	"time"
 
 	"github.com/opentracing/opentracing-go"
@@ -22,6 +23,8 @@ import (
 	"github.com/pingcap/tidb/br/pkg/utils"
 	"github.com/pingcap/tidb/br/pkg/version"
 	"github.com/pingcap/tidb/config"
+	"github.com/pingcap/tidb/kv"
+	"github.com/pingcap/tidb/meta"
 	"github.com/spf13/pflag"
 	"go.uber.org/multierr"
 	"go.uber.org/zap"
@@ -212,6 +215,41 @@ func CheckRestoreDBAndTable(client *restore.Client, cfg *RestoreConfig) error {
 	return nil
 }
 
+func getTableIDRange(tables []*metautil.Table) (min, max int64) {
+	min = int64(math.MaxInt64)
+
+	for _, t := range tables {
+		if t.Info.ID > max {
+			max = t.Info.ID
+		}
+		if t.Info.ID < min {
+			min = t.Info.ID
+		}
+	}
+	return
+}
+
+// preallocTableIDs peralloc the id for [start, end)
+func preallocTableIDs(m *meta.Meta, start, end int64) (map[int64]struct{}, error) {
+	currentId, err := m.GetGlobalID()
+	if err != nil {
+		return nil, err
+	}
+	if currentId > end {
+		return map[int64]struct{}{}, nil
+	}
+
+	result := make(map[int64]struct{}, end-currentId)
+	ids, err := m.GenGlobalIDs(int(end - currentId))
+	if err != nil {
+		return nil, err
+	}
+	for _, id := range ids {
+		result[id] = struct{}{}
+	}
+	return result, nil
+}
+
 // RunRestore starts a restore task inside the current goroutine.
 func RunRestore(c context.Context, g glue.Glue, cmdName string, cfg *RestoreConfig) error {
 	cfg.adjustRestoreConfig()
@@ -294,6 +332,7 @@ func RunRestore(c context.Context, g glue.Glue, cmdName string, cfg *RestoreConf
 	if len(dbs) == 0 && len(tables) != 0 {
 		return errors.Annotate(berrors.ErrRestoreInvalidBackup, "contain tables but no databases")
 	}
+
 	archiveSize := reader.ArchiveSize(ctx, files)
 	g.Record(summary.RestoreDataSize, archiveSize)
 	//restore from tidb will fetch a general Size issue https://github.com/pingcap/tidb/issues/27247
@@ -380,7 +419,17 @@ func RunRestore(c context.Context, g glue.Glue, cmdName string, cfg *RestoreConf
 			zap.Int("sessionCount", len(dbPool)),
 		)
 	}
-	tableStream := client.GoCreateTables(ctx, mgr.GetDomain(), tables, newTS, dbPool, errCh)
+	min, max := getTableIDRange(tables)
+	var ids map[int64]struct{}
+	kv.RunInNewTxn(ctx, mgr.GetStorage(), true, func(ctx context.Context, txn kv.Transaction) error {
+		ids2, err := preallocTableIDs(meta.NewMeta(txn), min, max)
+		if err != nil {
+			return err
+		}
+		ids = ids2
+		return nil
+	})
+	tableStream := client.GoCreateTables(context.WithValue(ctx, utils.TableIDs{}, ids), mgr.GetDomain(), tables, newTS, dbPool, errCh)
 	if len(files) == 0 {
 		log.Info("no files, empty databases and tables are restored")
 		summary.SetSuccessStatus(true)

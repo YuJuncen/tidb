@@ -2055,8 +2055,10 @@ func (d *ddl) CreateTableWithInfo(
 	}
 
 	// FIXME: Implement `tryRetainID`
-	if err := d.assignTableID(tbInfo); err != nil {
-		return errors.Trace(err)
+	if tryRetainID {
+		if err := d.assignTableID(tbInfo); err != nil {
+			return errors.Trace(err)
+		}
 	}
 
 	if tbInfo.Partition != nil {
