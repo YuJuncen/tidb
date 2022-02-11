@@ -350,6 +350,7 @@ func (importer *FileImporter) ImportKVFiles(
 				logutil.Key("fileStart", file.StartKey),
 				logutil.Key("fileEnd", file.EndKey),
 			)
+			summary.CollectInt("RegionInvolved", 1)
 		}
 		return nil
 	}, utils.NewImportSSTBackoffer())

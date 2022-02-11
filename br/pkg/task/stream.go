@@ -590,6 +590,8 @@ func RunStreamRestore(
 	cmdName string,
 	cfg *StreamConfig,
 ) error {
+	defer summary.Summary("log restore")
+
 	cfg.adjustRestoreConfig()
 
 	ctx, cancelFn := context.WithCancel(c)

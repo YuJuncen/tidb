@@ -1320,6 +1320,7 @@ func (rc *Client) RestoreKVFiles(ctx context.Context, rules map[int64]*RewriteRu
 			// so we can simply skip the file that doesn't have the rule here.
 			log.Info("skip file due to table id not matched", zap.String("file", file.Path))
 			onProgress()
+			summary.CollectInt("FileSkip", 1)
 			continue
 		}
 		rc.workerPool.ApplyOnErrorGroup(eg, func() error {
@@ -1327,6 +1328,7 @@ func (rc *Client) RestoreKVFiles(ctx context.Context, rules map[int64]*RewriteRu
 			defer func() {
 				log.Info("import files done", zap.String("name", file.Path), zap.Duration("take", time.Since(fileStart)))
 				onProgress()
+				summary.CollectInt("File", 1)
 			}()
 			return rc.fileImporter.ImportKVFiles(ectx, filesReplica, rule)
 		})
