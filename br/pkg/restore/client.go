@@ -1272,7 +1272,7 @@ func (rc *Client) FixIndex(ctx context.Context, schema, table, index string) err
 }
 
 // FixIndicdesOfTable tries to fix the indices of the table via `ADMIN RECOVERY INDEX`.
-func (rc *Client) FixIndicesOfTable(ctx context.Context, schema string, table *model.TableInfo) error {
+func (rc *Client) FixIndicesOfTable(ctx context.Context, schema string, table *model.TableInfo, onProgress func()) error {
 	tableName := table.Name.L
 	// NOTE: Maybe we can create multi sessions and restore indices concurrently?
 	for _, index := range table.Indices {
@@ -1280,6 +1280,7 @@ func (rc *Client) FixIndicesOfTable(ctx context.Context, schema string, table *m
 		if err := rc.FixIndex(ctx, schema, tableName, index.Name.L); err != nil {
 			return errors.Annotatef(err, "failed to fix index %s for table %s", index.Name, tableName)
 		}
+		onProgress()
 		log.Info("Fix index done.", zap.Stringer("take", time.Since(start)),
 			zap.String("table", tableName),
 			zap.String("database", schema),
@@ -1288,7 +1289,7 @@ func (rc *Client) FixIndicesOfTable(ctx context.Context, schema string, table *m
 	return nil
 }
 
-func (rc *Client) RestoreKVFiles(ctx context.Context, rules map[int64]*RewriteRules, files []*backuppb.DataFileInfo) error {
+func (rc *Client) RestoreKVFiles(ctx context.Context, rules map[int64]*RewriteRules, files []*backuppb.DataFileInfo, onProgress func()) error {
 	var err error
 	start := time.Now()
 	defer func() {
@@ -1318,12 +1319,14 @@ func (rc *Client) RestoreKVFiles(ctx context.Context, rules map[int64]*RewriteRu
 			// in next version we will perform rewrite and restore meta key to restore new created tables.
 			// so we can simply skip the file that doesn't have the rule here.
 			log.Info("skip file due to table id not matched", zap.String("file", file.Path))
+			onProgress()
 			continue
 		}
 		rc.workerPool.ApplyOnErrorGroup(eg, func() error {
 			fileStart := time.Now()
 			defer func() {
 				log.Info("import files done", zap.String("name", file.Path), zap.Duration("take", time.Since(fileStart)))
+				onProgress()
 			}()
 			return rc.fileImporter.ImportKVFiles(ectx, filesReplica, rule)
 		})

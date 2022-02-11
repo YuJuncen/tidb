@@ -677,12 +677,14 @@ func RunStreamRestore(
 	}
 
 	// perform restore kv files
-	if err := client.RestoreKVFiles(ctx, rewriteRules, datas); err != nil {
+	pd := g.StartProgress(ctx, "Restore KV Files", int64(len(datas)), false)
+	if err := client.RestoreKVFiles(ctx, rewriteRules, datas, pd.Inc); err != nil {
 		return errors.Trace(err)
 	}
 
+	pi := g.StartProgress(ctx, "Restore Index", countIndices(fullBackupTables), false)
 	for _, table := range fullBackupTables {
-		if err := client.FixIndicesOfTable(ctx, table.DB.Name.L, table.Info); err != nil {
+		if err := client.FixIndicesOfTable(ctx, table.DB.Name.L, table.Info, pi.Inc); err != nil {
 			return errors.Annotate(err, "failed to fix index for table")
 		}
 	}
