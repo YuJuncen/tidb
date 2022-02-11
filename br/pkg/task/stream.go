@@ -338,9 +338,10 @@ func RunStreamCommand(
 
 	if err := commandFn(ctx, g, cmdName, cfg); err != nil {
 		log.Error("failed to stream", zap.String("command", cmdName), zap.Error(err))
+		summary.CollectFailureUnit(cmdName, err)
 		return err
 	}
-
+	summary.Summary(cmdName)
 	return nil
 }
 
