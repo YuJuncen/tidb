@@ -1278,7 +1278,7 @@ func (rc *Client) FixIndicesOfTable(ctx context.Context, schema string, table *m
 	for _, index := range table.Indices {
 		start := time.Now()
 		if err := rc.FixIndex(ctx, schema, tableName, index.Name.L); err != nil {
-			return errors.Annotatef(err, "failed to fix index %s for table %s", index.Name, tableName)
+			return errors.Annotatef(err, "failed to fix index %s", index.Name)
 		}
 		onProgress()
 		log.Info("Fix index done.", zap.Stringer("take", time.Since(start)),
