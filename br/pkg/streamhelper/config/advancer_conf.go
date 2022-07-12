@@ -9,14 +9,21 @@ import (
 )
 
 const (
-	flagBackoffTime      = "backoff-time"
-	flagMaxBackoffTime   = "max-backoff-time"
-	flagTickInterval     = "tick-interval"
-	flagFullScanDiffTick = "full-scan-tick"
-	flagAdvancingByCache = "advancing-by-cache"
+	flagBackoffTime          = "backoff-time"
+	flagMaxBackoffTime       = "max-backoff-time"
+	flagTickInterval         = "tick-interval"
+	flagFullScanDiffTick     = "full-scan-tick"
+	flagAdvancingByCache     = "advancing-by-cache"
+	flagConsistencyCheckTick = "consistency-check-tick"
+	flagUpdateSmallTreeTick  = "update-small-tree-tick"
 
-	DefaultConsistencyCheckTick = 5
-	DefaultTryAdvanceThreshold  = 3 * time.Minute
+	DefaultConsistencyCheckTick            = 5
+	DefaultTickInterval                    = 3 * time.Second
+	DefaultBackOffTime                     = 5 * time.Second
+	DefaultTryAdvanceThreshold             = 3 * time.Minute
+	DefaultTickBeforeUpdateCheckpointLight = 5
+	DefaultTickBeforeFullScanRetry         = 2
+	DefaultAdvancingByCache                = true
 )
 
 var (
@@ -26,8 +33,6 @@ var (
 type Config struct {
 	// The gap between two retries.
 	BackoffTime time.Duration `toml:"backoff-time" json:"backoff-time"`
-	// When after this time we cannot collect the safe resolved ts, give up.
-	MaxBackoffTime time.Duration `toml:"max-backoff-time" json:"max-backoff-time"`
 	// The gap between calculating checkpoints.
 	TickDuration time.Duration `toml:"tick-interval" json:"tick-interval"`
 	// The backoff time of full scan.
@@ -35,34 +40,35 @@ type Config struct {
 
 	// Whether enable the optimization -- use a cached heap to advancing the global checkpoint.
 	// This may reduce the gap of checkpoint but may cost more CPU.
-	AdvancingByCache bool `toml:"advancing-by-cache" json:"advancing-by-cache"`
+	AdvancingByCache     bool `toml:"advancing-by-cache" json:"advancing-by-cache"`
+	ConsistencyCheckTick int  `toml:"consistency-check-tick" json:"consistency-check-tick"`
+	UpdateSmallTreeTick  int  `toml:"update-small-tree-tick" json:"update-small-tree-tick"`
 }
 
 func DefineFlagsForCheckpointAdvancerConfig(f *pflag.FlagSet) {
-	f.Duration(flagBackoffTime, 5*time.Second, "The gap between two retries.")
-	f.Duration(flagMaxBackoffTime, 20*time.Minute, "After how long we should advance the checkpoint.")
-	f.Duration(flagTickInterval, 12*time.Second, "From how log we trigger the tick (advancing the checkpoint).")
-	f.Bool(flagAdvancingByCache, true, "Whether enable the optimization -- use a cached heap to advancing the global checkpoint.")
-	f.Int(flagFullScanDiffTick, 4, "The backoff of full scan.")
+	f.Duration(flagTickInterval, DefaultTickInterval, "From how log we trigger the tick (advancing the checkpoint).")
+	f.Bool(flagAdvancingByCache, DefaultAdvancingByCache, "Whether enable the optimization -- use a cached heap to advancing the global checkpoint.")
+	f.Int(flagFullScanDiffTick, DefaultTickBeforeFullScanRetry, "The backoff of full scan.")
+	f.Duration(flagBackoffTime, DefaultBackOffTime, "The gap between two retries.")
+	f.Int(flagConsistencyCheckTick, DefaultConsistencyCheckTick, "The gap between two consistency check.")
+	f.Int(flagUpdateSmallTreeTick, DefaultTickBeforeUpdateCheckpointLight, "The gap between two update small tree.")
 }
 
 func Default() Config {
 	return Config{
-		BackoffTime:      5 * time.Second,
-		MaxBackoffTime:   20 * time.Minute,
-		TickDuration:     12 * time.Second,
-		FullScanTick:     4,
-		AdvancingByCache: true,
+		BackoffTime:          DefaultBackOffTime,
+		TickDuration:         DefaultTickInterval,
+		FullScanTick:         DefaultTickBeforeFullScanRetry,
+		AdvancingByCache:     DefaultAdvancingByCache,
+		ConsistencyCheckTick: DefaultConsistencyCheckTick,
+		UpdateSmallTreeTick:  DefaultTickBeforeUpdateCheckpointLight,
 	}
 }
 
+// GetFromFlags fills the config from the FlagSet.
 func (conf *Config) GetFromFlags(f *pflag.FlagSet) error {
 	var err error
 	conf.BackoffTime, err = f.GetDuration(flagBackoffTime)
-	if err != nil {
-		return err
-	}
-	conf.MaxBackoffTime, err = f.GetDuration(flagMaxBackoffTime)
 	if err != nil {
 		return err
 	}
@@ -75,6 +81,14 @@ func (conf *Config) GetFromFlags(f *pflag.FlagSet) error {
 		return err
 	}
 	conf.AdvancingByCache, err = f.GetBool(flagAdvancingByCache)
+	if err != nil {
+		return err
+	}
+	conf.ConsistencyCheckTick, err = f.GetInt(flagConsistencyCheckTick)
+	if err != nil {
+		return err
+	}
+	conf.UpdateSmallTreeTick, err = f.GetInt(flagUpdateSmallTreeTick)
 	if err != nil {
 		return err
 	}

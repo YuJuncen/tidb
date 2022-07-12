@@ -48,4 +48,10 @@ var (
 		Help:      "The batch size of scanning region or get region checkpoint.",
 		Buckets:   prometheus.ExponentialBuckets(1, 2.0, 12),
 	}, []string{"type"})
+	CurrentAdvancerState = prometheus.NewGauge(prometheus.GaugeOpts{
+		Namespace: "tidb",
+		Subsystem: "log_backup",
+		Name:      "current_advancer_state",
+		Help:      "The current advancer state; 1 -> full scan; 2 -> update small tree",
+	})
 )
