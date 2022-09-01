@@ -54,11 +54,13 @@ func (c flushSimulator) fork() flushSimulator {
 }
 
 type region struct {
-	rng        kv.KeyRange
-	leader     uint64
-	epoch      uint64
-	id         uint64
-	checkpoint uint64
+	rng    kv.KeyRange
+	leader uint64
+	epoch  uint64
+	id     uint64
+
+	checkpoint   uint64
+	checkpointMu sync.Mutex
 
 	fsim flushSimulator
 }
@@ -89,6 +91,8 @@ func overlaps(a, b kv.KeyRange) bool {
 }
 
 func (r *region) splitAt(newID uint64, k string) *region {
+	r.checkpointMu.Lock()
+	defer r.checkpointMu.Unlock()
 	newRegion := &region{
 		rng:        kv.KeyRange{StartKey: []byte(k), EndKey: r.rng.EndKey},
 		leader:     r.leader,
@@ -112,48 +116,54 @@ func (f *fakeStore) GetLastFlushTSOfRegion(ctx context.Context, in *logbackup.Ge
 		Checkpoints: []*logbackup.RegionCheckpoint{},
 	}
 	for _, r := range in.Regions {
-		region, ok := f.regions[r.Id]
-		if !ok || region.leader != f.id {
+		reg, ok := f.regions[r.Id]
+		if !ok || reg.leader != f.id {
 			resp.Checkpoints = append(resp.Checkpoints, &logbackup.RegionCheckpoint{
 				Err: &errorpb.Error{
 					Message: "not found",
 				},
 				Region: &logbackup.RegionIdentity{
-					Id:           region.id,
-					EpochVersion: region.epoch,
+					Id:           r.Id,
+					EpochVersion: r.EpochVersion,
 				},
 			})
 			continue
 		}
-		if err := region.fsim.makeError(r.EpochVersion); err != nil {
+		handleRegion := func(region *region) {
+			region.checkpointMu.Lock()
+			// Release all locks after finishing collect would be fine...?
+			defer region.checkpointMu.Unlock()
+			if err := region.fsim.makeError(r.EpochVersion); err != nil {
+				resp.Checkpoints = append(resp.Checkpoints, &logbackup.RegionCheckpoint{
+					Err: err,
+					Region: &logbackup.RegionIdentity{
+						Id:           region.id,
+						EpochVersion: region.epoch,
+					},
+				})
+				return
+			}
+			if region.epoch != r.EpochVersion {
+				resp.Checkpoints = append(resp.Checkpoints, &logbackup.RegionCheckpoint{
+					Err: &errorpb.Error{
+						Message: "epoch not match",
+					},
+					Region: &logbackup.RegionIdentity{
+						Id:           region.id,
+						EpochVersion: region.epoch,
+					},
+				})
+				return
+			}
 			resp.Checkpoints = append(resp.Checkpoints, &logbackup.RegionCheckpoint{
-				Err: err,
+				Checkpoint: region.checkpoint,
 				Region: &logbackup.RegionIdentity{
 					Id:           region.id,
 					EpochVersion: region.epoch,
 				},
 			})
-			continue
 		}
-		if region.epoch != r.EpochVersion {
-			resp.Checkpoints = append(resp.Checkpoints, &logbackup.RegionCheckpoint{
-				Err: &errorpb.Error{
-					Message: "epoch not match",
-				},
-				Region: &logbackup.RegionIdentity{
-					Id:           region.id,
-					EpochVersion: region.epoch,
-				},
-			})
-			continue
-		}
-		resp.Checkpoints = append(resp.Checkpoints, &logbackup.RegionCheckpoint{
-			Checkpoint: region.checkpoint,
-			Region: &logbackup.RegionIdentity{
-				Id:           region.id,
-				EpochVersion: region.epoch,
-			},
-		})
+		handleRegion(reg)
 	}
 	return resp, nil
 }
@@ -309,6 +319,8 @@ func (f *fakeCluster) advanceCheckpoints() uint64 {
 	minCheckpoint := uint64(math.MaxUint64)
 	for _, r := range f.regions {
 		f.updateRegion(r.id, func(r *region) {
+			r.checkpointMu.Lock()
+			defer r.checkpointMu.Unlock()
 			// The current implementation assumes that the server never returns checkpoint with value 0.
 			// This assumption is true for the TiKV implementation, simulating it here.
 			r.checkpoint += rand.Uint64()%256 + 1
