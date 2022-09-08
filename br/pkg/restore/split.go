@@ -113,6 +113,7 @@ SplitRegions:
 			return errors.Trace(errScan)
 		}
 		splitKeyMap := getSplitKeys(rewriteRules, sortedRanges, regions, isRawKv)
+		log.Info("would split", zap.Int("regions", len(regions)), zap.Int("keys-groups", len(splitKeyMap)))
 		regionMap := make(map[uint64]*RegionInfo)
 		for _, region := range regions {
 			regionMap[region.Region.GetId()] = region
@@ -147,6 +148,7 @@ SplitRegions:
 					logutil.Region(region.Region),
 					logutil.Leader(region.Leader),
 					logutil.Keys(keys), rtree.ZapRanges(ranges))
+				errSplit = nil
 				continue SplitRegions
 			}
 			log.Info("scattered regions", zap.Int("count", len(newRegions)))
