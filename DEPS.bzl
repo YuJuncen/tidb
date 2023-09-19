@@ -3061,8 +3061,14 @@ def go_deps():
         name = "com_github_pingcap_kvproto",
         build_file_proto_mode = "disable_global",
         importpath = "github.com/pingcap/kvproto",
-        sum = "h1:dLoYgMFgzUaS6fAAPdjA7oGDM0LdCIm+qhgb3PzrDps=",
-        version = "v0.0.0-20230726063044-73d6d7f3756b",
+        sha256 = "4af4342540977423986b6627c9efb98477c8a4746cf0c62d63251f6830ce3e3a",
+        strip_prefix = "github.com/yujuncen/kvproto@v0.0.0-20230913085421-7b5c641805b9",
+        urls = [
+            "http://bazel-cache.pingcap.net:8080/gomod/github.com/yujuncen/kvproto/com_github_yujuncen_kvproto-v0.0.0-20230913085421-7b5c641805b9.zip",
+            "http://ats.apps.svc/gomod/github.com/yujuncen/kvproto/com_github_yujuncen_kvproto-v0.0.0-20230913085421-7b5c641805b9.zip",
+            "https://cache.hawkingrei.com/gomod/github.com/yujuncen/kvproto/com_github_yujuncen_kvproto-v0.0.0-20230913085421-7b5c641805b9.zip",
+            "https://storage.googleapis.com/pingcapmirror/gomod/github.com/yujuncen/kvproto/com_github_yujuncen_kvproto-v0.0.0-20230913085421-7b5c641805b9.zip",
+        ],
     )
     go_repository(
         name = "com_github_pingcap_log",
