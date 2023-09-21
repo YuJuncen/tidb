@@ -5,7 +5,6 @@ go_library(
     srcs = [
         "backoff.go",
         "db.go",
-        "deny_importing.go",
         "dyn_pprof_other.go",
         "dyn_pprof_unix.go",
         "env.go",
@@ -21,6 +20,7 @@ go_library(
         "schema.go",
         "sensitive.go",
         "store_manager.go",
+        "suspend_importing.go",
         "worker.go",
     ],
     importpath = "github.com/pingcap/tidb/br/pkg/utils",
@@ -71,7 +71,6 @@ go_test(
     srcs = [
         "backoff_test.go",
         "db_test.go",
-        "deny_importing_test.go",
         "env_test.go",
         "json_test.go",
         "key_test.go",
@@ -83,6 +82,7 @@ go_test(
         "safe_point_test.go",
         "schema_test.go",
         "sensitive_test.go",
+        "suspend_importing_test.go",
     ],
     embed = [":utils"],
     flaky = True,
