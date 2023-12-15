@@ -455,9 +455,10 @@ func (p *PdController) doPauseSchedulers(ctx context.Context, schedulers []strin
 	for _, scheduler := range schedulers {
 		prefix := fmt.Sprintf("%s/%s", schedulerPrefix, scheduler)
 		for _, addr := range p.getAllPDAddrs() {
-			_, err = post(ctx, addr, prefix, p.cli, http.MethodPost, body)
+			resp, err := post(ctx, addr, prefix, p.cli, http.MethodPost, body)
 			if err == nil {
 				removedSchedulers = append(removedSchedulers, scheduler)
+				log.Info("Paused scheduler.", zap.String("response", string(resp)), zap.String("on", addr))
 				break
 			}
 		}
