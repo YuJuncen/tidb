@@ -101,6 +101,9 @@ func New(env Env) *Preparer {
 // Splitting, ingesting and conf changing will all be blocked.
 func (p *Preparer) DriveLoopAndWaitPrepare(ctx context.Context) error {
 	p.retryTime = 0
+	if err := p.prepareConnections(ctx); err != nil {
+		return errors.Annotate(err, "failed to prepare connections")
+	}
 	if err := p.MaybeFinish(ctx); err != nil {
 		return errors.Annotate(err, "failed to begin step")
 	}
@@ -331,4 +334,18 @@ func (p *Preparer) pushWaitApply(reqs pendingRequests, region Region) {
 	}
 	reqs[leader].Regions = append(reqs[leader].Regions, region.GetMeta())
 	p.inflightReqs[region.GetMeta().Id] = *region.GetMeta()
+}
+
+func (p *Preparer) prepareConnections(ctx context.Context) error {
+	stores, err := p.env.GetAllLiveStores(ctx)
+	if err != nil {
+		return errors.Annotate(err, "failed to get all live stores")
+	}
+	for _, store := range stores {
+		_, err := p.streamOf(ctx, store.Id)
+		if err != nil {
+			return errors.Annotatef(err, "failed to prepare connection to store %d", store.Id)
+		}
+	}
+	return nil
 }

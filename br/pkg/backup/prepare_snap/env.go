@@ -11,12 +11,14 @@ import (
 	"github.com/pingcap/tidb/br/pkg/logutil"
 	"github.com/pingcap/tidb/br/pkg/utils"
 	"github.com/tikv/client-go/v2/tikv"
+	pd "github.com/tikv/pd/client"
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
 )
 
 type Env interface {
 	ConnectToStore(ctx context.Context, storeID uint64) (PrepareClient, error)
+	GetAllLiveStores(ctx context.Context) ([]*metapb.Store, error)
 	LoadRegionsInKeyRange(ctx context.Context, startKey, endKey []byte) (regions []Region, err error)
 }
 
@@ -33,6 +35,10 @@ type Region interface {
 type CliEnv struct {
 	Cache *tikv.RegionCache
 	Mgr   *utils.StoreManager
+}
+
+func (c CliEnv) GetAllLiveStores(ctx context.Context) ([]*metapb.Store, error) {
+	return c.Cache.PDClient().GetAllStores(ctx, pd.WithExcludeTombstone())
 }
 
 func (c CliEnv) ConnectToStore(ctx context.Context, storeID uint64) (PrepareClient, error) {
