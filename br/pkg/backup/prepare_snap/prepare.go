@@ -12,6 +12,7 @@ import (
 	"github.com/pingcap/kvproto/pkg/metapb"
 	"github.com/pingcap/tidb/br/pkg/logutil"
 	"go.uber.org/zap"
+	"golang.org/x/sync/errgroup"
 )
 
 const (
@@ -118,10 +119,20 @@ func (p *Preparer) DriveLoopAndWaitPrepare(ctx context.Context) error {
 // Finalize notify the cluster to go back to the normal mode.
 // This will return an error if the cluster has already entered the normal mode when this is called.
 func (p *Preparer) Finalize(ctx context.Context) error {
+	eg := new(errgroup.Group)
 	for id, cli := range p.clients {
-		if err := cli.Finalize(ctx); err != nil {
-			return errors.Annotatef(err, "failed to finalize the prepare stream for %d", id)
-		}
+		cli := cli
+		id := id
+		eg.Go(func() error {
+			if err := cli.Finalize(ctx); err != nil {
+				return errors.Annotatef(err, "failed to finalize the prepare stream for %d", id)
+			}
+			return nil
+		})
+	}
+	if err := eg.Wait(); err != nil {
+		logutil.CL(ctx).Warn("failed to finalize some prepare streams.", logutil.ShortError(err))
+		return err
 	}
 	logutil.CL(ctx).Info("all connections to store have shuted down.")
 	for {
