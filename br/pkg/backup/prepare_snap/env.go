@@ -43,7 +43,7 @@ func (c CliEnv) GetAllLiveStores(ctx context.Context) ([]*metapb.Store, error) {
 
 func (c CliEnv) ConnectToStore(ctx context.Context, storeID uint64) (PrepareClient, error) {
 	var cli brpb.Backup_PrepareSnapshotBackupClient
-	c.Mgr.TryWithConn(ctx, storeID, func(cc *grpc.ClientConn) error {
+	err := c.Mgr.TryWithConn(ctx, storeID, func(cc *grpc.ClientConn) error {
 		bcli := brpb.NewBackupClient(cc)
 		c, err := bcli.PrepareSnapshotBackup(ctx)
 		if err != nil {
@@ -52,6 +52,9 @@ func (c CliEnv) ConnectToStore(ctx context.Context, storeID uint64) (PrepareClie
 		cli = c
 		return nil
 	})
+	if err != nil {
+		return nil, err
+	}
 	return cli, nil
 }
 
