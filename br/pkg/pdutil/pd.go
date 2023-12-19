@@ -116,7 +116,6 @@ var (
 		"shuffle-leader-scheduler":     {},
 		"shuffle-region-scheduler":     {},
 		"shuffle-hot-region-scheduler": {},
-		"evict-leader-scheduler":       {},
 	}
 	expectPDCfgGenerators = map[string]pauseConfigGenerator{
 		"merge-schedule-limit": zeroPauseConfig,
@@ -714,7 +713,6 @@ func (p *PdController) RemoveAllPDSchedulers(ctx context.Context) (undo UndoFunc
 		"merge-schedule-limit",
 		"region-schedule-limit",
 		"replica-schedule-limit",
-		enableTiKVSplitRegion,
 	}
 	pdConfigGenerators := DefaultExpectPDCfgGenerators()
 	for _, param := range scheduleLimitParams {
