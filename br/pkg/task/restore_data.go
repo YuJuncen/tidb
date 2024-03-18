@@ -57,7 +57,7 @@ func RunResolveKvData(c context.Context, g glue.Glue, cmdName string, cfg *Resto
 		return errors.Trace(err)
 	}
 
-	resolveTS, _, err = ReadBackupMetaData(ctx, externStorage)
+	resolveTS, numStores, err := ReadBackupMetaData(ctx, externStorage)
 	if err != nil {
 		return errors.Trace(err)
 	}
@@ -125,16 +125,19 @@ func RunResolveKvData(c context.Context, g glue.Glue, cmdName string, cfg *Resto
 		},
 		utils.NewPDReqBackofferExt(),
 	)
-	actualWorkForStore := len(allStores)
+	restoreNumStores := len(allStores)
+	if restoreNumStores != numStores {
+		log.Warn("the number of stores in the cluster has changed", zap.Int("origin", numStores), zap.Int("current", restoreNumStores))
+	}
 
 	if err != nil {
 		return errors.Trace(err)
 	}
 
-	log.Debug("total tikv", zap.Int("total", actualWorkForStore), zap.String("progress file", cfg.ProgressFile))
+	log.Debug("total tikv", zap.Int("total", restoreNumStores), zap.String("progress file", cfg.ProgressFile))
 	// progress = read meta + send recovery + iterate tikv + (1 * prepareflashback + 1 * flashback)
-	progress := g.StartProgress(ctx, cmdName, int64(actualWorkForStore*3+2), !cfg.LogProgress)
-	go progressFileWriterRoutine(ctx, progress, int64(actualWorkForStore*3+2), cfg.ProgressFile)
+	progress := g.StartProgress(ctx, cmdName, int64(restoreNumStores*3+2), !cfg.LogProgress)
+	go progressFileWriterRoutine(ctx, progress, int64(restoreNumStores*3+2), cfg.ProgressFile)
 
 	// restore tikv data from a snapshot volume
 	var totalRegions int
