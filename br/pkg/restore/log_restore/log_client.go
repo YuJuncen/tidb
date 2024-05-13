@@ -136,11 +136,11 @@ func (rc *LogFileManager) loadShiftTS(ctx context.Context) error {
 	return nil
 }
 
-func (rc *LogFileManager) streamingMeta(ctx context.Context) (MetaIter, error) {
-	return rc.streamingMetaByTS(ctx, rc.RestoreTS)
+func (rc *LogFileManager) StreamingMeta(ctx context.Context) (MetaIter, error) {
+	return rc.StreamingMetaByTS(ctx, rc.RestoreTS)
 }
 
-func (rc *LogFileManager) streamingMetaByTS(ctx context.Context, restoreTS uint64) (MetaIter, error) {
+func (rc *LogFileManager) StreamingMetaByTS(ctx context.Context, restoreTS uint64) (MetaIter, error) {
 	it, err := rc.createMetaIterOver(ctx, rc.storage)
 	if err != nil {
 		return nil, err
@@ -240,7 +240,7 @@ func (rc *LogFileManager) collectDDLFilesAndPrepareCache(
 // At the same time, if the `counter` isn't nil, counting the DML file needs to be restored into `counter`.
 // This function returns all DDL files needing directly because we need sort all of them.
 func (rc *LogFileManager) LoadDDLFilesAndCountDMLFiles(ctx context.Context, counter *int) ([]Log, error) {
-	m, err := rc.streamingMeta(ctx)
+	m, err := rc.StreamingMeta(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -263,7 +263,7 @@ func (rc *LogFileManager) LoadDDLFilesAndCountDMLFiles(ctx context.Context, coun
 // LoadDMLFiles loads all DML files needs to be restored in the restoration.
 // This function returns a stream, because there are usually many DML files need to be restored.
 func (rc *LogFileManager) LoadDMLFiles(ctx context.Context) (LogIter, error) {
-	m, err := rc.streamingMeta(ctx)
+	m, err := rc.StreamingMeta(ctx)
 	if err != nil {
 		return nil, err
 	}

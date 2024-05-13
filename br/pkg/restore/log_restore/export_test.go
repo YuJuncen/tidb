@@ -23,7 +23,7 @@ import (
 
 // readStreamMetaByTS is used for streaming task. collect all meta file by TS, it is for test usage.
 func (rc *LogFileManager) ReadStreamMeta(ctx context.Context) ([]Meta, error) {
-	metas, err := rc.streamingMeta(ctx)
+	metas, err := rc.StreamingMeta(ctx)
 	if err != nil {
 		return nil, err
 	}
