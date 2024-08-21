@@ -18,6 +18,7 @@ import (
 	"github.com/fsouza/fake-gcs-server/fakestorage"
 	"github.com/pingcap/errors"
 	"github.com/pingcap/failpoint"
+	backup "github.com/pingcap/kvproto/pkg/brpb"
 	backuppb "github.com/pingcap/kvproto/pkg/brpb"
 	"github.com/pingcap/log"
 	"github.com/pingcap/tidb/br/pkg/storage"
@@ -728,7 +729,7 @@ func mTruncatedTo(to uint64) migOP {
 func tmp(t *testing.T) *storage.LocalStorage {
 	tmpDir := t.TempDir()
 	s, err := storage.NewLocalStorage(tmpDir)
-	require.NoError(t, os.MkdirAll(path.Join(tmpDir, migrationPrefix), 0644))
+	require.NoError(t, os.MkdirAll(path.Join(tmpDir, migrationPrefix), 0744))
 	require.NoError(t, err)
 	s.IgnoreEnoentForDelete = true
 	return s
@@ -2778,4 +2779,48 @@ func TestRetryRemoveCompaction(t *testing.T) {
 	// So the dir itself won't be deleted, we check the content has been deleted here.
 	require.NoFileExists(t, path.Join(s.Base(), cDir(1), "monolith"))
 	require.NoFileExists(t, path.Join(s.Base(), aDir(1), "monolith"))
+}
+
+func TestWithSimpleTruncate(t *testing.T) {
+	s := tmp(t)
+	ctx := context.Background()
+	mN := func(n uint64) string { return fmt.Sprintf("v1/backupmeta/%05d.meta", n) }
+
+	pmt(s, mN(1), mf(1, [][]*backuppb.DataFileInfo{
+		{
+			fi(10, 20, DefaultCF, 0),
+			fi(15, 30, WriteCF, 8),
+			fi(25, 35, WriteCF, 11),
+		},
+	}))
+	pmt(s, mN(2), mf(2, [][]*backuppb.DataFileInfo{
+		{
+			fi(45, 64, WriteCF, 32),
+			fi(65, 70, WriteCF, 55),
+			fi(50, 60, DefaultCF, 0),
+			fi(80, 85, WriteCF, 72),
+		},
+	}))
+
+	est := MigerationExtension(s)
+	m := mig(mTruncatedTo(65))
+	var res MigratedTo
+	effs := est.DryRun(func(me MigrationExt) { res = me.MigrateTo(ctx, m) })
+
+	require.Empty(t, res.Warnings)
+	for _, eff := range effs {
+		switch e := eff.(type) {
+		case *storage.EffDeleteFile:
+			require.Equal(t, e, mN(1))
+		case *storage.EffPut:
+			var m backup.Metadata
+			require.NoError(t, m.Unmarshal(e.Content))
+			require.Equal(t, e.File, mN(2))
+			require.ElementsMatch(t, m.FileGroups[0].DataFilesInfo, []*backuppb.DataFileInfo{
+				fi(65, 70, WriteCF, 55),
+				fi(50, 60, DefaultCF, 0),
+				fi(80, 85, WriteCF, 72),
+			})
+		}
+	}
 }

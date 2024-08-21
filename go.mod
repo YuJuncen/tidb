@@ -87,7 +87,7 @@ require (
 	github.com/pingcap/errors v0.11.5-0.20240318064555-6bd07397691f
 	github.com/pingcap/failpoint v0.0.0-20240527053858-9b3b6e34194a
 	github.com/pingcap/fn v1.0.0
-	github.com/pingcap/kvproto v0.0.0-20240620063548-118a4cab53e4
+	github.com/pingcap/kvproto v0.0.0-20240821071924-c203a27de26d
 	github.com/pingcap/log v1.1.1-0.20240314023424-862ccc32f18d
 	github.com/pingcap/sysutil v1.0.1-0.20240311050922-ae81ee01f3a5
 	github.com/pingcap/tidb/pkg/parser v0.0.0-20211011031125-9b13dc409c5e
@@ -155,6 +155,7 @@ require (
 	github.com/apache/arrow/go/v12 v12.0.1 // indirect
 	github.com/cockroachdb/tokenbucket v0.0.0-20230807174530-cc333fc44b06 // indirect
 	github.com/getsentry/sentry-go v0.27.0 // indirect
+	github.com/ghodss/yaml v1.0.0 // indirect
 	github.com/goccy/go-reflect v1.2.0 // indirect
 	github.com/google/flatbuffers v2.0.8+incompatible // indirect
 	github.com/klauspost/asmfmt v1.3.2 // indirect
@@ -330,7 +331,6 @@ replace (
 	github.com/dgrijalva/jwt-go => github.com/form3tech-oss/jwt-go v3.2.6-0.20210809144907-32ab6a8243d7+incompatible
 	github.com/go-ldap/ldap/v3 => github.com/YangKeao/ldap/v3 v3.4.5-0.20230421065457-369a3bab1117
 
-	github.com/pingcap/kvproto => github.com/yujuncen/kvproto v0.0.0-20240725064730-6d93a3086bf2
 	github.com/pingcap/tidb/pkg/parser => ./pkg/parser
 
 	// TODO: `sourcegraph.com/sourcegraph/appdash` has been archived, and the original host has been removed.

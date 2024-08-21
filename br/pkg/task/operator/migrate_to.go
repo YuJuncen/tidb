@@ -5,6 +5,7 @@ import (
 
 	"github.com/fatih/color"
 	"github.com/pingcap/errors"
+	backup "github.com/pingcap/kvproto/pkg/brpb"
 	"github.com/pingcap/tidb/br/pkg/glue"
 	"github.com/pingcap/tidb/br/pkg/storage"
 	"github.com/pingcap/tidb/br/pkg/stream"
@@ -38,20 +39,16 @@ func (cx migrateToCtx) printErr(errs []error, msg string) {
 	}
 }
 
-func (cx migrateToCtx) estlimateByLog(migs stream.Migrations, targetVersion int) error {
-	targetMig := migs.MergeTo(targetVersion)
+func (cx migrateToCtx) askForContinue(targetMig *backup.Migration) bool {
 	tbl := cx.console.CreateTable()
 	stream.AddMigrationToTable(targetMig, tbl)
 	cx.console.Println("The migration going to be executed will be like: ")
 	tbl.Print()
 
-	if !cx.console.PromptBool("continue?") {
-		return errors.Annotatef(context.Canceled, "the user aborted the operation")
-	}
-	return nil
+	return cx.console.PromptBool("Continue? ")
 }
 
-func (cx migrateToCtx) dryRun(ctx context.Context, targetVersion int) error {
+func (cx migrateToCtx) dryRun(f func(stream.MigrationExt) stream.MergeAndMigratedTo) error {
 	var (
 		est     = cx.est
 		console = cx.console
@@ -59,7 +56,7 @@ func (cx migrateToCtx) dryRun(ctx context.Context, targetVersion int) error {
 		effects []storage.Effect
 	)
 	effects = est.DryRun(func(me stream.MigrationExt) {
-		estBase = me.MergeAndMigrateTo(ctx, targetVersion)
+		estBase = f(me)
 	})
 
 	tbl := console.CreateTable()
@@ -111,28 +108,24 @@ func RunMigrateTo(ctx context.Context, cfg MigrateToConfig) error {
 		console.Printf("No recent migration found. Skipping.")
 	}
 
-	if !cfg.Yes {
-		err := cx.estlimateByLog(migs, targetVersion)
-		if err != nil {
-			return err
+	run := func(f func(stream.MigrationExt) stream.MergeAndMigratedTo) error {
+		result := f(est)
+		if len(result.Warnings) > 0 {
+			console.Printf("The following errors happened, you may re-execute to retry: ")
+			for _, w := range result.Warnings {
+				console.Printf("- %s\n", color.HiRedString(w.Error()))
+			}
 		}
+		return nil
 	}
-
 	if cfg.DryRun {
-		// Note: this shouldn't be committed even user requires,
-		// as once we encounter error during committing,
-		// we won't record the failure to the new BASE migration.
-		// Then those files failed to be deleted will leak.
-		return cx.dryRun(ctx, targetVersion)
+		run = cx.dryRun
 	}
 
-	result := est.MergeAndMigrateTo(ctx, targetVersion)
-	if len(result.Warnings) > 0 {
-		console.Printf("The following errors happened, you may re-execute to retry: ")
-		for _, w := range result.Warnings {
-			console.Printf("- %s\n", color.HiRedString(w.Error()))
-		}
-	}
-
+	run(func(est stream.MigrationExt) stream.MergeAndMigratedTo {
+		return est.MergeAndMigrateTo(ctx, targetVersion, stream.MMOptInteractiveCheck(func(ctx context.Context, m *backup.Migration) bool {
+			return cfg.Yes && cx.askForContinue(m)
+		}))
+	})
 	return nil
 }
