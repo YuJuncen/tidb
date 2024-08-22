@@ -18,7 +18,6 @@ import (
 	"github.com/fsouza/fake-gcs-server/fakestorage"
 	"github.com/pingcap/errors"
 	"github.com/pingcap/failpoint"
-	backup "github.com/pingcap/kvproto/pkg/brpb"
 	backuppb "github.com/pingcap/kvproto/pkg/brpb"
 	"github.com/pingcap/log"
 	"github.com/pingcap/tidb/br/pkg/storage"
@@ -587,7 +586,7 @@ func mCompaction(cPath, aPath string, fromTs, untilTs uint64) migOP {
 	return func(m *backuppb.Migration) {
 		c := &backuppb.LogFileCompaction{}
 		c.GeneratedFiles = cPath
-		c.Artifactes = aPath
+		c.Artifacts = aPath
 		c.CompactionFromTs = fromTs
 		c.CompactionUntilTs = untilTs
 		m.Compactions = append(m.Compactions, c)
@@ -2813,7 +2812,7 @@ func TestWithSimpleTruncate(t *testing.T) {
 		case *storage.EffDeleteFile:
 			require.Equal(t, e, mN(1))
 		case *storage.EffPut:
-			var m backup.Metadata
+			var m backuppb.Metadata
 			require.NoError(t, m.Unmarshal(e.Content))
 			require.Equal(t, e.File, mN(2))
 			require.ElementsMatch(t, m.FileGroups[0].DataFilesInfo, []*backuppb.DataFileInfo{
