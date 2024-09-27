@@ -16,16 +16,21 @@ package flashbacktest
 
 import (
 	"context"
+	"encoding/hex"
 	"fmt"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/pingcap/failpoint"
+	"github.com/pingcap/kvproto/pkg/kvrpcpb"
 	ddlutil "github.com/pingcap/tidb/pkg/ddl/util"
 	"github.com/pingcap/tidb/pkg/errno"
+	"github.com/pingcap/tidb/pkg/kv"
 	"github.com/pingcap/tidb/pkg/meta"
 	"github.com/pingcap/tidb/pkg/parser/model"
+	"github.com/pingcap/tidb/pkg/tablecodec"
 	"github.com/pingcap/tidb/pkg/testkit"
 	"github.com/pingcap/tidb/pkg/testkit/testfailpoint"
 	"github.com/pingcap/tidb/pkg/types"
@@ -33,6 +38,8 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/tikv/client-go/v2/oracle"
+	"github.com/tikv/client-go/v2/tikv"
+	"github.com/tikv/client-go/v2/tikvrpc"
 	tikvutil "github.com/tikv/client-go/v2/util"
 )
 
@@ -58,6 +65,100 @@ func MockGC(tk *testkit.TestKit) (string, string, string, func()) {
 	// clear GC variables first.
 	tk.MustExec("delete from mysql.tidb where variable_name in ( 'tikv_gc_safe_point','tikv_gc_enable' )")
 	return timeBeforeDrop, timeAfterDrop, safePointSQL, resetGC
+}
+
+func TestFlashbackStaleRead(t *testing.T) {
+	if !*realtikvtest.WithRealTiKV {
+		return
+	}
+
+	store := realtikvtest.CreateMockStoreAndSetup(t)
+	kvStore := store.(tikv.Storage)
+	tk := testkit.NewTestKit(t, store)
+
+	timeBeforeDrop, _, safePointSQL, resetGC := MockGC(tk)
+	defer resetGC()
+	tk.MustExec(fmt.Sprintf(safePointSQL, timeBeforeDrop))
+	tk.MustExec("use test")
+	tk.MustExec("drop table if exists t")
+	tk.MustExec("create table t(a int)")
+
+	// KvPrewrite some rows.
+	tableID, err := strconv.ParseInt(tk.MustQuery("select tidb_table_id from information_schema.tables where table_name = 't'").Rows()[0][0].(string), 10, 64)
+	require.NoError(t, err)
+
+	ctx := context.Background()
+	mkMutation := func(handle int) *kvrpcpb.Mutation {
+		require.LessOrEqual(t, handle, 0xff)
+		// Constructing a row value requires too many context...
+		hackyValue, err := hex.DecodeString(fmt.Sprintf("800001000000010100%02X", handle))
+		require.NoError(t, err)
+		return &kvrpcpb.Mutation{
+			Op:    kvrpcpb.Op_Put,
+			Key:   tablecodec.EncodeRowKeyWithHandle(tableID, kv.IntHandle(handle)),
+			Value: hackyValue,
+		}
+	}
+
+	rc := kvStore.GetRegionCache()
+	bo := tikv.NewBackoffer(ctx, 5000)
+
+	mkPrewrite := func(startTS uint64, handle int, pkHandle int) {
+		req := &kvrpcpb.PrewriteRequest{
+			Mutations:    []*kvrpcpb.Mutation{mkMutation(handle)},
+			PrimaryLock:  tablecodec.EncodeRowKeyWithHandle(tableID, kv.IntHandle(pkHandle)),
+			StartVersion: startTS,
+			LockTtl:      4000,
+		}
+		loc, err := rc.LocateKey(bo, req.Mutations[0].Key)
+		require.NoError(t, err)
+		_, err = kvStore.SendReq(bo, tikvrpc.NewRequest(tikvrpc.CmdPrewrite, req), loc.Region, time.Second*10)
+		require.NoError(t, err)
+
+		fmt.Println("prewrite", startTS, handle, loc)
+	}
+	mkCommit := func(startTS uint64, commitTS uint64, pkHandle int, commitRegionOfHandle int) {
+		require.NoError(t, err)
+		loc, err := rc.LocateKey(bo, tablecodec.EncodeRowKeyWithHandle(tableID, kv.IntHandle(commitRegionOfHandle)))
+		require.NoError(t, err)
+		req := &kvrpcpb.CommitRequest{
+			StartVersion:  startTS,
+			Keys:          [][]byte{tablecodec.EncodeRowKeyWithHandle(tableID, kv.IntHandle(pkHandle))},
+			CommitVersion: commitTS,
+		}
+		_, err = kvStore.SendReq(bo, tikvrpc.NewRequest(tikvrpc.CmdCommit, req), loc.Region, time.Second*10)
+		require.NoError(t, err)
+
+		fmt.Println("commit", commitTS, commitRegionOfHandle, loc)
+	}
+	allocateTs := func() uint64 {
+		res, err := store.GetOracle().GetTimestamp(ctx, &oracle.Option{})
+		require.NoError(t, err)
+		return res
+	}
+
+	r := tk.MustQuery("split table t by (0), (43), (255)")
+	fmt.Printf("%#v\n", r)
+
+	time.Sleep(time.Second)
+	startTS := allocateTs()
+	mkPrewrite(startTS, 42, 42)
+	mkPrewrite(startTS, 44, 42)
+	time.Sleep(time.Second)
+	commitTS := allocateTs()
+	mkCommit(startTS, commitTS, 42, 42)
+	time.Sleep(time.Second)
+
+	tsoToSQL := func(ts uint64) string { return oracle.GetTimeFromTS(ts).Format(types.TimeFSPFormat) }
+	injectSafeTS := oracle.GoTimeToTS(oracle.GetTimeFromTS(startTS - 1).Add(100 * time.Second))
+	require.NoError(t, failpoint.Enable("github.com/pingcap/tidb/pkg/ddl/injectSafeTS",
+		fmt.Sprintf("return(%v)", injectSafeTS)))
+	tk.MustExec(fmt.Sprintf("flashback cluster to tso %d", startTS-1))
+
+	res := tk.MustQuery(fmt.Sprintf("select * from t as of timestamp '%s'", tsoToSQL(commitTS+(10<<18))))
+	require.Equal(t, len(res.Rows()), 2)
+	require.Equal(t, res.Rows()[0][0], "42")
+	require.Equal(t, res.Rows()[1][0], "44")
 }
 
 func TestFlashback(t *testing.T) {
