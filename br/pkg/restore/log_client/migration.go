@@ -19,6 +19,7 @@ import (
 
 	backuppb "github.com/pingcap/kvproto/pkg/brpb"
 	"github.com/pingcap/tidb/br/pkg/storage"
+	"github.com/pingcap/tidb/br/pkg/stream"
 	"github.com/pingcap/tidb/br/pkg/utils/iter"
 )
 
@@ -144,6 +145,7 @@ func (builder *WithMigrationsBuilder) coarseGrainedFilter(mig *backuppb.Migratio
 func (builder *WithMigrationsBuilder) Build(migs []*backuppb.Migration) WithMigrations {
 	skipmap := make(metaSkipMap)
 	compactionDirs := make([]string, 0, 8)
+	fullBackups := make([]string, 0, 8)
 
 	for _, mig := range migs {
 		// TODO: deal with TruncatedTo and DestructPrefix
@@ -155,10 +157,14 @@ func (builder *WithMigrationsBuilder) Build(migs []*backuppb.Migration) WithMigr
 		for _, c := range mig.Compactions {
 			compactionDirs = append(compactionDirs, c.Artifacts)
 		}
+
+		fullBackups = append(fullBackups, mig.ExtraFullBackupPaths...)
 	}
 	withMigrations := WithMigrations{
 		skipmap:        skipmap,
 		compactionDirs: compactionDirs,
+		fullBackups:    fullBackups,
+		restoredTS:     builder.restoredTS,
 	}
 	return withMigrations
 }
@@ -210,6 +216,8 @@ func (mwm *MetaWithMigrations) Physicals(groupIndexIter GroupIndexIter) Physical
 type WithMigrations struct {
 	skipmap        metaSkipMap
 	compactionDirs []string
+	fullBackups    []string
+	restoredTS     uint64
 }
 
 func (wm *WithMigrations) Metas(metaNameIter MetaNameIter) MetaMigrationsIter {
@@ -236,5 +244,16 @@ func (wm *WithMigrations) Compactions(ctx context.Context, s storage.ExternalSto
 	return iter.FlatMap(compactionDirIter, func(name string) iter.TryNextor[*backuppb.LogFileSubcompaction] {
 		// name is the absolute path in external storage.
 		return Subcompactions(ctx, name, s)
+	})
+}
+
+func (wm *WithMigrations) ExtraFullBackups(ctx context.Context, s storage.ExternalStorage) iter.TryNextor[*backuppb.ExtraFullBackup] {
+	filteredOut := iter.FilterOut(stream.LoadExtraFullBackups(ctx, s, wm.fullBackups), func(ebk stream.ExtraFullBackups) bool {
+		return !ebk.GroupFinished() || ebk.GroupTS() > wm.restoredTS
+	})
+	return iter.FlatMap(filteredOut, func(ebk stream.ExtraFullBackups) iter.TryNextor[*backuppb.ExtraFullBackup] {
+		return iter.Map(iter.FromSlice(ebk), func(p stream.PathedExtraFullBackup) *backuppb.ExtraFullBackup {
+			return p.ExtraFullBackup
+		})
 	})
 }
