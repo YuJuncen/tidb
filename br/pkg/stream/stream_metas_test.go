@@ -656,6 +656,12 @@ func pmig(s storage.ExternalStorage, num uint64, mt *backuppb.Migration) string 
 	return p
 }
 
+func mVersion(v backuppb.MigrationVersion) migOP {
+	return func(m *backuppb.Migration) {
+		m.Version = v
+	}
+}
+
 func mTruncatedTo(to uint64) migOP {
 	return func(m *backuppb.Migration) {
 		m.TruncatedTo = to
