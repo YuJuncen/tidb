@@ -19,8 +19,10 @@ import (
 	"fmt"
 	"testing"
 
+	"github.com/google/uuid"
 	backuppb "github.com/pingcap/kvproto/pkg/brpb"
 	logclient "github.com/pingcap/tidb/br/pkg/restore/log_client"
+	"github.com/pingcap/tidb/br/pkg/storage"
 	"github.com/pingcap/tidb/br/pkg/utils/iter"
 	"github.com/stretchr/testify/require"
 )
@@ -349,4 +351,155 @@ func TestMigrations(t *testing.T) {
 			}
 		}
 	}
+}
+
+type efOP func(*backuppb.IngestedSSTs)
+
+func extFullBkup(ops ...efOP) *backuppb.IngestedSSTs {
+	ef := &backuppb.IngestedSSTs{}
+	for _, op := range ops {
+		op(ef)
+	}
+	return ef
+}
+
+func finished() efOP {
+	return func(ef *backuppb.IngestedSSTs) {
+		ef.Finished = true
+	}
+}
+
+func makeID() efOP {
+	id := uuid.New()
+	return func(ef *backuppb.IngestedSSTs) {
+		ef.BackupUuid = id[:]
+	}
+}
+
+func prefix(pfx string) efOP {
+	return func(ef *backuppb.IngestedSSTs) {
+		ef.FilesPrefixHint = pfx
+	}
+}
+
+func asIfTS(ts uint64) efOP {
+	return func(ef *backuppb.IngestedSSTs) {
+		ef.AsIfTs = ts
+	}
+}
+
+func pef(t *testing.T, fb *backuppb.IngestedSSTs, sn int, s storage.ExternalStorage) string {
+	path := fmt.Sprintf("extbackupmeta_%08d", sn)
+	bs, err := fb.Marshal()
+	if err != nil {
+		require.NoError(t, err)
+	}
+
+	err = s.WriteFile(context.Background(), path, bs)
+	require.NoError(t, err)
+	return path
+}
+
+// tmp creates a temporary storage.
+func tmp(t *testing.T) *storage.LocalStorage {
+	tmpDir := t.TempDir()
+	s, err := storage.NewLocalStorage(tmpDir)
+	require.NoError(t, err)
+	s.IgnoreEnoentForDelete = true
+	return s
+}
+
+func assertFullBackupPfxs(t *testing.T, it iter.TryNextor[*backuppb.IngestedSSTs], items ...string) {
+	i := 0
+	for res := it.TryNext(context.Background()); !res.Finished; res = it.TryNext(context.Background()) {
+		require.NoError(t, res.Err)
+		require.Equal(t, items[i], res.Item.FilesPrefixHint,
+			"item %d not match, wants %s, got %s", i, items[i], res.Item.FilesPrefixHint)
+		i++
+	}
+	require.Equal(t, i, len(items), "not exceeded: %#v, i = %d", items, i)
+}
+
+func TestNotRestoreIncomplete(t *testing.T) {
+	ctx := context.Background()
+	strg := tmp(t)
+	ebk := extFullBkup(prefix("001"), asIfTS(90), makeID())
+	wm := new(logclient.WithMigrations)
+	wm.AddIngestedSSTs(pef(t, ebk, 0, strg))
+	wm.SetRestoredTS(91)
+
+	assertFullBackupPfxs(t, wm.IngestedSSTss(ctx, strg))
+}
+
+func TestRestoreSegmented(t *testing.T) {
+	ctx := context.Background()
+	strg := tmp(t)
+	id := makeID()
+	ebk1 := extFullBkup(prefix("001"), id)
+	ebk2 := extFullBkup(prefix("002"), asIfTS(90), finished(), id)
+	wm := new(logclient.WithMigrations)
+	wm.AddIngestedSSTs(pef(t, ebk1, 0, strg))
+	wm.AddIngestedSSTs(pef(t, ebk2, 1, strg))
+	wm.SetRestoredTS(91)
+
+	assertFullBackupPfxs(t, wm.IngestedSSTss(ctx, strg), "001", "002")
+}
+
+func TestFilteredOut(t *testing.T) {
+	ctx := context.Background()
+	strg := tmp(t)
+	id := makeID()
+	ebk1 := extFullBkup(prefix("001"), id)
+	ebk2 := extFullBkup(prefix("002"), asIfTS(90), finished(), id)
+	ebk3 := extFullBkup(prefix("003"), asIfTS(10), finished(), makeID())
+	wm := new(logclient.WithMigrations)
+	wm.AddIngestedSSTs(pef(t, ebk1, 0, strg))
+	wm.AddIngestedSSTs(pef(t, ebk2, 1, strg))
+	wm.AddIngestedSSTs(pef(t, ebk3, 2, strg))
+	wm.SetRestoredTS(89)
+	wm.SetStartTS(42)
+
+	assertFullBackupPfxs(t, wm.IngestedSSTss(ctx, strg))
+}
+
+func TestMultiRestores(t *testing.T) {
+	ctx := context.Background()
+	strg := tmp(t)
+	id := makeID()
+	id2 := makeID()
+
+	ebka1 := extFullBkup(prefix("001"), id)
+	ebkb1 := extFullBkup(prefix("101"), id2)
+	ebkb2 := extFullBkup(prefix("102"), asIfTS(88), finished(), id2)
+	ebka2 := extFullBkup(prefix("002"), asIfTS(90), finished(), id)
+
+	wm := new(logclient.WithMigrations)
+	wm.AddIngestedSSTs(pef(t, ebka1, 0, strg))
+	wm.AddIngestedSSTs(pef(t, ebkb1, 2, strg))
+	wm.AddIngestedSSTs(pef(t, ebkb2, 3, strg))
+	wm.AddIngestedSSTs(pef(t, ebka2, 4, strg))
+	wm.SetRestoredTS(91)
+
+	assertFullBackupPfxs(t, wm.IngestedSSTss(ctx, strg), "101", "102", "001", "002")
+}
+
+func TestMultiFilteredOutOne(t *testing.T) {
+	ctx := context.Background()
+	strg := tmp(t)
+	id := makeID()
+	id2 := makeID()
+
+	ebka1 := extFullBkup(prefix("001"), id)
+	ebkb1 := extFullBkup(prefix("101"), id2)
+	ebkb2 := extFullBkup(prefix("102"), asIfTS(88), finished(), id2)
+	ebka2 := extFullBkup(prefix("002"), asIfTS(90), finished(), id)
+
+	wm := new(logclient.WithMigrations)
+	wm.AddIngestedSSTs(pef(t, ebka1, 0, strg))
+	wm.AddIngestedSSTs(pef(t, ebkb1, 2, strg))
+	wm.AddIngestedSSTs(pef(t, ebkb2, 3, strg))
+	wm.AddIngestedSSTs(pef(t, ebka2, 4, strg))
+	wm.SetRestoredTS(89)
+
+	assertFullBackupPfxs(t, wm.IngestedSSTss(ctx, strg), "101", "102")
 }
