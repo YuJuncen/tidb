@@ -1006,7 +1006,30 @@ func isConnectionResetError(err error) bool {
 	return strings.Contains(err.Error(), "read: connection reset")
 }
 
-func (rl retryerWithLog) ShouldRetry(r *request.Request) bool {
+func isConnectionRefusedError(err error) bool {
+	return strings.Contains(err.Error(), "connection refused")
+}
+
+func isHTTP2ConnAborted(err error) bool {
+	patterns := []string{
+		"http2: client connection force closed via ClientConn.Close",
+		"http2: server sent GOAWAY and closed the connection",
+	}
+	errMsg := err.Error()
+
+	for _, p := range patterns {
+		if strings.Contains(errMsg, p) {
+			return true
+		}
+	}
+	return false
+}
+
+func (rl retryerWithLog) ShouldRetry(r *request.Request) (retry bool) {
+	defer func() {
+		log.Warn("failed to request s3, checking whether we can retry", zap.Error(r.Error), zap.Bool("retry", retry))
+	}()
+
 	// for unit test
 	failpoint.Inject("replace-error-to-connection-reset-by-peer", func(_ failpoint.Value) {
 		log.Info("original error", zap.Error(r.Error))
@@ -1022,14 +1045,15 @@ func (rl retryerWithLog) ShouldRetry(r *request.Request) bool {
 	if isConnectionResetError(r.Error) {
 		return true
 	}
+	if isHTTP2ConnAborted(r.Error) {
+		return true
+	}
 	return rl.DefaultRetryer.ShouldRetry(r)
 }
 
 func (rl retryerWithLog) RetryRules(r *request.Request) time.Duration {
 	backoffTime := rl.DefaultRetryer.RetryRules(r)
-	if backoffTime > 0 {
-		log.Warn("failed to request s3, retrying", zap.Error(r.Error), zap.Duration("backoff", backoffTime))
-	}
+	log.Warn("failed to request s3, retrying", zap.Error(r.Error), zap.Duration("backoff", backoffTime))
 	return backoffTime
 }
 
