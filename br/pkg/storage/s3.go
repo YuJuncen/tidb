@@ -515,7 +515,7 @@ func (rs *S3Storage) WriteFile(ctx context.Context, file string, data []byte) er
 
 func (rs *S3Storage) ReadFile(ctx context.Context, file string) ([]byte, error) {
 	backoff := 10 * time.Millisecond
-	remainRetry := 3
+	remainRetry := 5
 	contRetry := func() bool {
 		if remainRetry <= 0 {
 			return false
@@ -527,7 +527,8 @@ func (rs *S3Storage) ReadFile(ctx context.Context, file string) ([]byte, error) 
 	for {
 		data, err := rs.doReadFile(ctx, file)
 		if err != nil {
-			log.Warn("ReadFile: failed to read file.", zap.String("file", file), logutil.ShortError(err))
+			log.Warn("ReadFile: failed to read file.",
+				zap.String("file", file), logutil.ShortError(err), zap.Int("remained", remainRetry))
 			if !isHTTP2ConnAborted(err) {
 				return nil, err
 			}
