@@ -33,7 +33,6 @@ import (
 	"github.com/pingcap/log"
 	berrors "github.com/pingcap/tidb/br/pkg/errors"
 	"github.com/pingcap/tidb/br/pkg/logutil"
-	"github.com/pingcap/tidb/br/pkg/utils"
 	"github.com/spf13/pflag"
 	"go.uber.org/zap"
 )
@@ -515,19 +514,30 @@ func (rs *S3Storage) WriteFile(ctx context.Context, file string, data []byte) er
 }
 
 func (rs *S3Storage) ReadFile(ctx context.Context, file string) ([]byte, error) {
-	retryStat := utils.InitialRetryState(3, 10*time.Millisecond, 40*time.Millisecond)
-	// Note: we are retrying all failures...
-	return utils.WithRetryV2(ctx, &retryStat, func(ctx context.Context) ([]byte, error) {
+	backoff := 10 * time.Millisecond
+	remainRetry := 3
+	contRetry := func() bool {
+		if remainRetry <= 0 {
+			return false
+		}
+		time.Sleep(backoff)
+		remainRetry -= 1
+		return true
+	}
+	for {
 		data, err := rs.doReadFile(ctx, file)
 		if err != nil {
 			log.Warn("ReadFile: failed to read file.", zap.String("file", file), logutil.ShortError(err))
 			if !isHTTP2ConnAborted(err) {
-				retryStat.GiveUp()
+				return nil, err
 			}
-			return nil, err
+			if !contRetry() {
+				return nil, err
+			}
+			continue
 		}
 		return data, nil
-	})
+	}
 }
 
 // ReadFile reads the file from the storage and returns the contents.
