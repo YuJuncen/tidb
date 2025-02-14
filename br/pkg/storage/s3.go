@@ -1042,6 +1042,7 @@ func isHTTP2ConnAborted(err error) bool {
 	patterns := []string{
 		"http2: client connection force closed via ClientConn.Close",
 		"http2: server sent GOAWAY and closed the connection",
+		"unexpected EOF",
 	}
 	errMsg := err.Error()
 
