@@ -5,10 +5,12 @@ package streamhelper
 import (
 	"context"
 	"math"
+	"slices"
 	"time"
 
 	"github.com/pingcap/errors"
 	logbackup "github.com/pingcap/kvproto/pkg/logbackuppb"
+	"github.com/pingcap/kvproto/pkg/metapb"
 	"github.com/pingcap/tidb/br/pkg/utils"
 	"github.com/pingcap/tidb/pkg/config"
 	"github.com/pingcap/tidb/pkg/util/engine"
@@ -43,6 +45,7 @@ type Env interface {
 // to adapt the requirement of `RegionScan`.
 type PDRegionScanner struct {
 	pd.Client
+	Cache *tikv.RegionCache
 }
 
 // Updates the service GC safe point for the cluster.
@@ -75,15 +78,22 @@ func (c PDRegionScanner) FetchCurrentTS(ctx context.Context) (uint64, error) {
 // Limit limits the maximum number of regions returned.
 func (c PDRegionScanner) RegionScan(ctx context.Context, key, endKey []byte, limit int) ([]RegionWithLeader, error) {
 	//nolint:staticcheck
-	rs, err := c.Client.ScanRegions(ctx, key, endKey, limit, opt.WithAllowFollowerHandle())
+	bo := tikv.NewBackoffer(ctx, int((15 * time.Second).Milliseconds()))
+	rs, err := c.Cache.BatchLoadRegionsWithKeyRange(bo, key, endKey, limit)
 	if err != nil {
 		return nil, err
 	}
 	rls := make([]RegionWithLeader, 0, len(rs))
 	for _, r := range rs {
+		ldID := r.GetLeaderPeerID()
+		ldIdx := slices.IndexFunc(r.GetMeta().Peers, func(p *metapb.Peer) bool { return p.Id == ldID })
+		if ldIdx < 0 {
+			return nil, errors.Annotatef(err, "region %d has no leader, peers = %s; leader peer id = %d",
+				r.GetMeta().Id, r.GetMeta().Peers, ldID)
+		}
 		rls = append(rls, RegionWithLeader{
-			Region: r.Meta,
-			Leader: r.Leader,
+			Region: r.GetMeta(),
+			Leader: r.GetMeta().Peers[ldIdx],
 		})
 	}
 	return rls, nil
@@ -136,9 +146,12 @@ func (t clusterEnv) ClearCache(ctx context.Context, storeID uint64) error {
 // CliEnv creates the Env for CLI usage.
 func CliEnv(cli *utils.StoreManager, tikvStore tikv.Storage, etcdCli *clientv3.Client) Env {
 	return clusterEnv{
-		clis:                 cli,
-		AdvancerExt:          &AdvancerExt{MetaDataClient: *NewMetaDataClient(etcdCli)},
-		PDRegionScanner:      PDRegionScanner{cli.PDClient()},
+		clis:        cli,
+		AdvancerExt: &AdvancerExt{MetaDataClient: *NewMetaDataClient(etcdCli)},
+		PDRegionScanner: PDRegionScanner{
+			Client: cli.PDClient(),
+			Cache:  tikv.NewRegionCache(cli.PDClient()),
+		},
 		AdvancerLockResolver: newAdvancerLockResolver(tikvStore),
 	}
 }
@@ -155,7 +168,7 @@ func TiDBEnv(tikvStore tikv.Storage, pdCli pd.Client, etcdCli *clientv3.Client, 
 			Timeout: time.Duration(conf.TiKVClient.GrpcKeepAliveTimeout) * time.Second,
 		}, tconf),
 		AdvancerExt:          &AdvancerExt{MetaDataClient: *NewMetaDataClient(etcdCli)},
-		PDRegionScanner:      PDRegionScanner{Client: pdCli},
+		PDRegionScanner:      PDRegionScanner{Client: pdCli, Cache: tikv.NewRegionCache(pdCli)},
 		AdvancerLockResolver: newAdvancerLockResolver(tikvStore),
 	}, nil
 }
