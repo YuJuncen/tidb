@@ -44,6 +44,7 @@ import (
 
 const (
 	cseScanURL            = "http://cse-ctl/scan"
+	cseSampleURL          = "http://cse-ctl/sample"
 	cseMetricsURL         = "http://cse-ctl/metrics"
 	cseScanStatusTrailer  = "x-cse-scan-status"
 	cseScanErrorTrailer   = "x-cse-scan-error"
@@ -208,6 +209,26 @@ type cseDumperScanRequest struct {
 	EndKeyHex   string `json:"end_key_hex"`
 }
 
+type cseDumperSampleResponse struct {
+	Ranges []cseDumperScanRequest `json:"ranges"`
+}
+
+func (d *cseDumper) sample(
+	ctx context.Context,
+	startKey, endKey []byte,
+) ([]packedRange, error) {
+	ranges, err := d.client.sample(ctx, startKey, endKey)
+	if err == nil {
+		return ranges, nil
+	}
+	select {
+	case <-d.process.done:
+		return nil, d.process.exitError("serve sample")
+	default:
+		return nil, err
+	}
+}
+
 func (d *cseDumper) scan(
 	ctx context.Context,
 	startKey, endKey []byte,
@@ -253,6 +274,83 @@ func (c *cseDumperClient) scan(
 		response: response,
 		input:    bufio.NewReaderSize(response.Body, 256*1024),
 	}, nil
+}
+
+func (c *cseDumperClient) sample(
+	ctx context.Context,
+	startKey, endKey []byte,
+) ([]packedRange, error) {
+	payload, err := json.Marshal(cseDumperScanRequest{
+		StartKeyHex: hex.EncodeToString(startKey),
+		EndKeyHex:   hex.EncodeToString(endKey),
+	})
+	if err != nil {
+		return nil, errors.Annotate(err, "encode cse-ctl dumper sample request")
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, cseSampleURL, bytes.NewReader(payload))
+	if err != nil {
+		return nil, errors.Annotate(err, "create cse-ctl dumper sample request")
+	}
+	request.Header.Set("Content-Type", "application/json")
+	response, err := c.httpClient.Do(request)
+	if err != nil {
+		return nil, errors.Annotate(err, "request cse-ctl dumper sample")
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		detail, _ := io.ReadAll(io.LimitReader(response.Body, 64<<10))
+		return nil, errors.Errorf("cse-ctl dumper sample returned %s: %s", response.Status, strings.TrimSpace(string(detail)))
+	}
+	var sampled cseDumperSampleResponse
+	if err := json.NewDecoder(response.Body).Decode(&sampled); err != nil {
+		return nil, errors.Annotate(err, "decode cse-ctl dumper sample response")
+	}
+	return decodeCSESampleRanges(startKey, endKey, sampled.Ranges)
+}
+
+func decodeCSESampleRanges(
+	requestedStart, requestedEnd []byte,
+	encoded []cseDumperScanRequest,
+) ([]packedRange, error) {
+	if len(encoded) == 0 {
+		return nil, errors.New("cse-ctl dumper sample returned no ranges")
+	}
+	ranges := make([]packedRange, 0, len(encoded))
+	nextStart := requestedStart
+	for index, sampled := range encoded {
+		start, err := hex.DecodeString(sampled.StartKeyHex)
+		if err != nil {
+			return nil, errors.Annotatef(err, "decode cse-ctl sampled range %d start key", index)
+		}
+		end, err := hex.DecodeString(sampled.EndKeyHex)
+		if err != nil {
+			return nil, errors.Annotatef(err, "decode cse-ctl sampled range %d end key", index)
+		}
+		if !bytes.Equal(start, nextStart) {
+			return nil, errors.Errorf(
+				"cse-ctl sampled range %d starts at %x instead of %x",
+				index,
+				start,
+				nextStart,
+			)
+		}
+		if bytes.Compare(start, end) >= 0 {
+			return nil, errors.Errorf("cse-ctl sampled range %d is empty or reversed", index)
+		}
+		if bytes.Compare(end, requestedEnd) > 0 {
+			return nil, errors.Errorf("cse-ctl sampled range %d ends outside the requested range", index)
+		}
+		ranges = append(ranges, packedRange{start: start, end: end})
+		nextStart = end
+	}
+	if !bytes.Equal(nextStart, requestedEnd) {
+		return nil, errors.Errorf(
+			"cse-ctl sampled ranges end at %x instead of %x",
+			nextStart,
+			requestedEnd,
+		)
+	}
+	return ranges, nil
 }
 
 type cseMetricsGatherer struct {

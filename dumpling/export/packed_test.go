@@ -159,6 +159,43 @@ func TestPackedProtocolRows(t *testing.T) {
 		require.Fail(t, "HTTP/2 test server did not stop")
 	}
 
+	client.httpClient.Transport = roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		require.Equal(t, http.MethodPost, request.Method)
+		require.Equal(t, cseSampleURL, request.URL.String())
+		var sampledRequest cseDumperScanRequest
+		require.NoError(t, json.NewDecoder(request.Body).Decode(&sampledRequest))
+		require.Equal(t, cseDumperScanRequest{StartKeyHex: "00ff", EndKeyHex: "10"}, sampledRequest)
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body: io.NopCloser(strings.NewReader(
+				`{"ranges":[{"start_key_hex":"00ff","end_key_hex":"01"},{"start_key_hex":"01","end_key_hex":"10"}]}`,
+			)),
+		}, nil
+	})
+	ranges, err := client.sample(context.Background(), []byte{0, 0xff}, []byte{0x10})
+	require.NoError(t, err)
+	require.Equal(t, []packedRange{
+		{start: []byte{0, 0xff}, end: []byte{1}},
+		{start: []byte{1}, end: []byte{0x10}},
+	}, ranges)
+
+	invalidSamples := []cseDumperSampleResponse{
+		{},
+		{Ranges: []cseDumperScanRequest{{StartKeyHex: "zz", EndKeyHex: "10"}}},
+		{Ranges: []cseDumperScanRequest{{StartKeyHex: "00ff", EndKeyHex: "00ff"}}},
+		{Ranges: []cseDumperScanRequest{{StartKeyHex: "01", EndKeyHex: "10"}}},
+		{Ranges: []cseDumperScanRequest{
+			{StartKeyHex: "00ff", EndKeyHex: "02"},
+			{StartKeyHex: "01", EndKeyHex: "10"},
+		}},
+		{Ranges: []cseDumperScanRequest{{StartKeyHex: "00ff", EndKeyHex: "11"}}},
+		{Ranges: []cseDumperScanRequest{{StartKeyHex: "00ff", EndKeyHex: "01"}}},
+	}
+	for _, sampled := range invalidSamples {
+		_, err := decodeCSESampleRanges([]byte{0, 0xff}, []byte{0x10}, sampled.Ranges)
+		require.Error(t, err)
+	}
+
 	client.httpClient.Transport = roundTripFunc(func(*http.Request) (*http.Response, error) {
 		return &http.Response{
 			StatusCode: http.StatusOK,
@@ -199,6 +236,8 @@ func TestPackedProtocolRows(t *testing.T) {
 	}
 	_, err = dumper.scan(context.Background(), []byte{1}, []byte{2})
 	require.EqualError(t, err, "cse-ctl dumper exited while trying to serve scan: context canceled; stderr: test exit")
+	_, err = dumper.sample(context.Background(), []byte{1}, []byte{2})
+	require.EqualError(t, err, "cse-ctl dumper exited while trying to serve sample: context canceled; stderr: test exit")
 
 	client.httpClient.Transport = roundTripFunc(func(request *http.Request) (*http.Response, error) {
 		require.Equal(t, http.MethodGet, request.Method)
@@ -261,6 +300,7 @@ func TestDumpPackedFromTiDBStorage(t *testing.T) {
 	config.StatusAddr = ""
 	config.PackedBackup = "packed-test"
 	config.FileType = FileFormatCSVString
+	config.FileSize = 1
 	config.NoHeader = true
 	config.CsvOutputDialect = CSVDialectSnowflake
 	config.TableFilter = tf.NewSchemasFilter("test")
@@ -272,11 +312,11 @@ func TestDumpPackedFromTiDBStorage(t *testing.T) {
 	require.NoError(t, dumper.dumpPackedFrom(scanner))
 
 	expectedFiles := map[string]string{
-		"test.packed_int.000000000.csv": "" +
-			`1,"alpha",\N,"00ff",-12.30,"2026-07-16 01:02:03.456","0a","done","a,b",7,\N` + "\r\n" +
-			`2,"beta","","",0.00,"2020-01-02 03:04:05.000","01","new","",7,\N` + "\r\n",
-		"test.packed_common.000000000.csv":    `"acme",9,"common"` + "\r\n",
-		"test.packed_partition.000000000.csv": `1,"first"` + "\r\n" + `11,"second"` + "\r\n",
+		"test.packed_int.0000000000000.csv":       `1,"alpha",\N,"00ff",-12.30,"2026-07-16 01:02:03.456","0a","done","a,b",7,\N` + "\r\n",
+		"test.packed_int.0000000010000.csv":       `2,"beta","","",0.00,"2020-01-02 03:04:05.000","01","new","",7,\N` + "\r\n",
+		"test.packed_common.0000000000000.csv":    `"acme",9,"common"` + "\r\n",
+		"test.packed_partition.0000000000000.csv": `1,"first"` + "\r\n",
+		"test.packed_partition.0000000010000.csv": `11,"second"` + "\r\n",
 	}
 	for name, expected := range expectedFiles {
 		content, err := os.ReadFile(filepath.Join(outputDir, name))
@@ -299,8 +339,15 @@ func TestDumpPackedFromTiDBStorage(t *testing.T) {
 	for _, entry := range entries {
 		actualFiles = append(actualFiles, entry.Name())
 	}
-	expectedNames := append(schemaFiles, "test.packed_int.000000000.csv")
-	expectedNames = append(expectedNames, "test.packed_common.000000000.csv", "test.packed_partition.000000000.csv")
+	expectedNames := append(schemaFiles,
+		"test.packed_int.0000000000000.csv",
+		"test.packed_int.0000000010000.csv",
+	)
+	expectedNames = append(expectedNames,
+		"test.packed_common.0000000000000.csv",
+		"test.packed_partition.0000000000000.csv",
+		"test.packed_partition.0000000010000.csv",
+	)
 	require.ElementsMatch(t, expectedNames, actualFiles)
 }
 
@@ -320,7 +367,7 @@ func newPackedTestCSEClient(t *testing.T, store kv.Storage) *cseDumperClient {
 		server := &http2.Server{}
 		server.ServeConn(connection, &http2.ServeConnOpts{
 			Handler: http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
-				servePackedTestScan(store, writer, request)
+				servePackedTestRequest(store, writer, request)
 			}),
 		})
 	}()
@@ -338,22 +385,63 @@ func newPackedTestCSEClient(t *testing.T, store kv.Storage) *cseDumperClient {
 	return client
 }
 
-func servePackedTestScan(store kv.Storage, writer http.ResponseWriter, request *http.Request) {
-	if request.Method != http.MethodPost || request.URL.Path != "/scan" {
+func servePackedTestRequest(store kv.Storage, writer http.ResponseWriter, request *http.Request) {
+	if request.Method != http.MethodPost {
 		http.Error(writer, "unsupported packed test request", http.StatusNotFound)
 		return
 	}
+	switch request.URL.Path {
+	case "/sample":
+		servePackedTestSample(store, writer, request)
+	case "/scan":
+		servePackedTestScan(store, writer, request)
+	default:
+		http.Error(writer, "unsupported packed test request", http.StatusNotFound)
+	}
+}
+
+func decodePackedTestRange(request *http.Request) ([]byte, []byte, error) {
 	var scanRequest cseDumperScanRequest
 	if err := json.NewDecoder(request.Body).Decode(&scanRequest); err != nil {
-		http.Error(writer, err.Error(), http.StatusBadRequest)
-		return
+		return nil, nil, err
 	}
 	startKey, err := hex.DecodeString(scanRequest.StartKeyHex)
+	if err != nil {
+		return nil, nil, err
+	}
+	endKey, err := hex.DecodeString(scanRequest.EndKeyHex)
+	if err != nil {
+		return nil, nil, err
+	}
+	return startKey, endKey, nil
+}
+
+func servePackedTestSample(store kv.Storage, writer http.ResponseWriter, request *http.Request) {
+	startKey, endKey, err := decodePackedTestRange(request)
 	if err != nil {
 		http.Error(writer, err.Error(), http.StatusBadRequest)
 		return
 	}
-	endKey, err := hex.DecodeString(scanRequest.EndKeyHex)
+	ranges, err := samplePackedTestRange(store, startKey, endKey)
+	if err != nil {
+		http.Error(writer, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	response := cseDumperSampleResponse{Ranges: make([]cseDumperScanRequest, 0, len(ranges))}
+	for _, rangeToScan := range ranges {
+		response.Ranges = append(response.Ranges, cseDumperScanRequest{
+			StartKeyHex: hex.EncodeToString(rangeToScan.start),
+			EndKeyHex:   hex.EncodeToString(rangeToScan.end),
+		})
+	}
+	writer.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(writer).Encode(response); err != nil {
+		http.Error(writer, err.Error(), http.StatusInternalServerError)
+	}
+}
+
+func servePackedTestScan(store kv.Storage, writer http.ResponseWriter, request *http.Request) {
+	startKey, endKey, err := decodePackedTestRange(request)
 	if err != nil {
 		http.Error(writer, err.Error(), http.StatusBadRequest)
 		return
@@ -367,6 +455,35 @@ func servePackedTestScan(store kv.Storage, writer http.ResponseWriter, request *
 		return
 	}
 	writer.Header().Set(cseScanStatusTrailer, cseScanStatusComplete)
+}
+
+func samplePackedTestRange(store kv.Storage, startKey, endKey []byte) ([]packedRange, error) {
+	txn, err := store.Begin()
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = txn.Rollback() }()
+	iterator, err := txn.Iter(kv.Key(startKey), kv.Key(endKey))
+	if err != nil {
+		return nil, err
+	}
+	defer iterator.Close()
+	ranges := make([]packedRange, 0, 1)
+	nextStart := append([]byte(nil), startKey...)
+	first := true
+	for iterator.Valid() {
+		if first {
+			first = false
+		} else {
+			nextEnd := append([]byte(nil), iterator.Key()...)
+			ranges = append(ranges, packedRange{start: nextStart, end: nextEnd})
+			nextStart = nextEnd
+		}
+		if err := iterator.Next(); err != nil {
+			return nil, err
+		}
+	}
+	return append(ranges, packedRange{start: nextStart, end: append([]byte(nil), endKey...)}), nil
 }
 
 func writePackedTestRange(store kv.Storage, output io.Writer, startKey, endKey []byte) error {

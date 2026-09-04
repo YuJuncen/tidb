@@ -158,6 +158,7 @@ type packedTableData struct {
 }
 
 type packedScanner interface {
+	sample(ctx context.Context, startKey, endKey []byte) ([]packedRange, error)
 	scan(ctx context.Context, startKey, endKey []byte) (*cseDumperScan, error)
 }
 
@@ -169,12 +170,13 @@ type packedRange struct {
 func newPackedTableData(
 	scanner packedScanner,
 	table *model.TableInfo,
+	ranges []packedRange,
 	metrics *metrics,
 ) *packedTableData {
 	return &packedTableData{
 		scanner: scanner,
 		table:   table,
-		ranges:  packedPhysicalTableRanges(table),
+		ranges:  ranges,
 		metrics: metrics,
 	}
 }
@@ -449,6 +451,23 @@ func packedPhysicalTableRanges(table *model.TableInfo) []packedRange {
 	return ranges
 }
 
+func samplePackedTableRanges(
+	ctx context.Context,
+	scanner packedScanner,
+	table *model.TableInfo,
+) ([]packedRange, error) {
+	physicalRanges := packedPhysicalTableRanges(table)
+	sampled := make([]packedRange, 0, len(physicalRanges))
+	for _, physicalRange := range physicalRanges {
+		ranges, err := scanner.sample(ctx, physicalRange.start, physicalRange.end)
+		if err != nil {
+			return nil, err
+		}
+		sampled = append(sampled, ranges...)
+	}
+	return sampled, nil
+}
+
 func packedCommonHandleColumnOffsets(table *model.TableInfo) (map[int64]int, error) {
 	offsets := make(map[int64]int)
 	if !table.IsCommonHandle {
@@ -642,15 +661,24 @@ func (d *Dumper) dumpPackedFrom(scanner packedScanner) error {
 			}
 			meta := newPackedTableMeta(database.Name.O, table, createSQL)
 			if !d.conf.NoData {
-				data := newPackedTableData(
-					scanner,
-					table,
-					d.metrics,
-				)
-				if err := send(NewTaskTableData(meta, data, 0, 1)); err != nil {
+				ranges, err := samplePackedTableRanges(d.tctx, scanner, table)
+				if err != nil {
 					close(taskIn)
 					_ = wg.Wait()
 					return err
+				}
+				for chunkIndex, rangeToScan := range ranges {
+					data := newPackedTableData(
+						scanner,
+						table,
+						[]packedRange{rangeToScan},
+						d.metrics,
+					)
+					if err := send(NewTaskTableData(meta, data, chunkIndex, len(ranges))); err != nil {
+						close(taskIn)
+						_ = wg.Wait()
+						return err
+					}
 				}
 			}
 		}
