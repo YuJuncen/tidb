@@ -29,7 +29,6 @@ import (
 	tcontext "github.com/pingcap/tidb/dumpling/context"
 	"github.com/pingcap/tidb/pkg/executor"
 	"github.com/pingcap/tidb/pkg/expression"
-	"github.com/pingcap/tidb/pkg/expression/exprstatic"
 	"github.com/pingcap/tidb/pkg/kv"
 	tidbmeta "github.com/pingcap/tidb/pkg/meta"
 	"github.com/pingcap/tidb/pkg/meta/autoid"
@@ -37,11 +36,12 @@ import (
 	"github.com/pingcap/tidb/pkg/parser/charset"
 	"github.com/pingcap/tidb/pkg/parser/mysql"
 	"github.com/pingcap/tidb/pkg/structure"
-	tidbtable "github.com/pingcap/tidb/pkg/table"
 	"github.com/pingcap/tidb/pkg/tablecodec"
 	"github.com/pingcap/tidb/pkg/types"
+	"github.com/pingcap/tidb/pkg/util/chunk"
 	"github.com/pingcap/tidb/pkg/util/codec"
 	"github.com/pingcap/tidb/pkg/util/mock"
+	"github.com/pingcap/tidb/pkg/util/rowcodec"
 	"go.uber.org/zap"
 	"golang.org/x/sync/errgroup"
 )
@@ -182,10 +182,7 @@ func newPackedTableData(
 }
 
 func (d *packedTableData) Start(tctx *tcontext.Context, _ *sql.Conn) error {
-	decoder, err := newPackedRowDecoder(d.table)
-	if err != nil {
-		return err
-	}
+	decoder := newPackedRowDecoder(d.table)
 	iter := &packedRowIter{
 		ctx:     tctx,
 		scanner: d.scanner,
@@ -223,7 +220,6 @@ type packedRowIter struct {
 	key       []byte
 	value     []byte
 	args      []any
-	defaults  expression.BuildContext
 	err       error
 	hasRow    bool
 }
@@ -231,44 +227,31 @@ type packedRowIter struct {
 func (i *packedRowIter) HasNext() bool { return i.err == nil && i.hasRow }
 
 func (i *packedRowIter) Decode(receiver RowReceiver) error {
-	started := time.Now()
-	err := i.decode(receiver)
-	i.metrics.observePackedPhase(packedPhaseDecode, started, err)
-	return err
-}
-
-func (i *packedRowIter) decode(receiver RowReceiver) error {
 	if !i.HasNext() {
 		return errors.New("packed backup row iterator has no current row")
 	}
 	if i.decoder == nil {
-		decoder, err := newPackedRowDecoder(i.table)
-		if err != nil {
-			return err
-		}
-		i.decoder = decoder
+		i.decoder = newPackedRowDecoder(i.table)
 	}
-	if i.defaults == nil {
-		i.defaults = exprstatic.NewExprContext()
-	}
-	values, err := i.decoder.decode(i.table, i.key, i.value, i.defaults)
+	values, err := i.decoder.decode(i.table, i.key, i.value)
 	if err != nil {
 		return err
 	}
-	if len(values) != len(i.args) {
-		return errors.Errorf("packed backup row has %d values for %d columns", len(values), len(i.args))
+	if values.Len() != len(i.args) {
+		return errors.Errorf("packed backup row has %d values for %d columns", values.Len(), len(i.args))
 	}
 	receiver.BindAddress(i.args)
-	for index := range values {
+	for index, column := range i.decoder.columns {
+		value := values.GetDatum(index, &column.FieldType)
 		destination, ok := i.args[index].(*sql.RawBytes)
 		if !ok {
 			return errors.Errorf("unsupported Dumpling packed row receiver %T", i.args[index])
 		}
-		if values[index].IsNull() {
+		if value.IsNull() {
 			*destination = nil
 			continue
 		}
-		data, err := values[index].ToBytes()
+		data, err := value.ToString()
 		if err != nil {
 			return errors.Annotatef(err, "format packed backup column %d", index)
 		}
@@ -338,85 +321,42 @@ func (i *packedRowIter) readNext() {
 }
 
 type packedRowDecoder struct {
-	columns             []*model.ColumnInfo
-	columnTypes         map[int64]*types.FieldType
-	commonHandleOffsets map[int64]int
+	columns []*model.ColumnInfo
+	ctx     *mock.Context
+	schema  *expression.Schema
+	decoder *rowcodec.ChunkDecoder
+	chunk   *chunk.Chunk
 }
 
-func newPackedRowDecoder(table *model.TableInfo) (*packedRowDecoder, error) {
+func newPackedRowDecoder(table *model.TableInfo) *packedRowDecoder {
 	columns := packedVisibleColumns(table)
-	columnTypes := make(map[int64]*types.FieldType, len(columns))
+	schema := expression.NewSchema()
+	fieldTypes := make([]*types.FieldType, 0, len(columns))
 	for _, column := range columns {
-		if !table.PKIsHandle || !mysql.HasPriKeyFlag(column.GetFlag()) {
-			columnTypes[column.ID] = &column.FieldType
-		}
+		schema.Append(&expression.Column{ID: column.ID, RetType: &column.FieldType})
+		fieldTypes = append(fieldTypes, &column.FieldType)
 	}
-	commonHandleOffsets, err := packedCommonHandleColumnOffsets(table)
-	if err != nil {
-		return nil, err
-	}
+	ctx := mock.NewContextDeprecated()
+	ctx.ResetSessionAndStmtTimeZone(time.UTC)
 	return &packedRowDecoder{
-		columns:             columns,
-		columnTypes:         columnTypes,
-		commonHandleOffsets: commonHandleOffsets,
-	}, nil
+		columns: columns,
+		ctx:     ctx,
+		schema:  schema,
+		decoder: executor.NewRowDecoder(ctx, schema, table),
+		chunk:   chunk.New(fieldTypes, 1, 1),
+	}
 }
 
-func (d *packedRowDecoder) decode(
-	table *model.TableInfo,
-	key, value []byte,
-	defaults expression.BuildContext,
-) ([]types.Datum, error) {
+func (d *packedRowDecoder) decode(table *model.TableInfo, key, value []byte) (chunk.Row, error) {
 	handle, err := tablecodec.DecodeRowKey(key)
 	if err != nil {
-		return nil, errors.Annotatef(err, "decode packed backup row key %x", key)
+		return chunk.Row{}, errors.Annotatef(err, "decode packed backup row key %x", key)
 	}
-	rowMap, err := tablecodec.DecodeRowToDatumMap(value, d.columnTypes, time.UTC)
-	if err != nil {
-		return nil, errors.Annotatef(err, "decode packed backup row value at key %x", key)
+	d.chunk.Reset()
+	if err := executor.DecodeRowValToChunk(d.ctx, d.schema, table, handle, value, d.chunk, d.decoder); err != nil {
+		return chunk.Row{}, errors.Annotatef(err, "decode packed backup row value at key %x", key)
 	}
-	values := make([]types.Datum, 0, len(d.columns))
-	for _, column := range d.columns {
-		decoded, err := decodePackedColumn(table, column, handle, rowMap, d.commonHandleOffsets, defaults)
-		if err != nil {
-			return nil, errors.Annotatef(err, "decode column %q at packed backup key %x", column.Name.O, key)
-		}
-		values = append(values, decoded)
-	}
-	return values, nil
-}
-
-func decodePackedColumn(
-	table *model.TableInfo,
-	column *model.ColumnInfo,
-	handle kv.Handle,
-	rowMap map[int64]types.Datum,
-	commonHandleOffsets map[int64]int,
-	defaults expression.BuildContext,
-) (types.Datum, error) {
-	if table.PKIsHandle && mysql.HasPriKeyFlag(column.GetFlag()) {
-		var value types.Datum
-		if mysql.HasUnsignedFlag(column.GetFlag()) {
-			value.SetUint64(uint64(handle.IntValue()))
-		} else {
-			value.SetInt64(handle.IntValue())
-		}
-		return value, nil
-	}
-	if handleOffset, ok := commonHandleOffsets[column.ID]; ok {
-		if handleOffset >= handle.NumCols() {
-			return types.Datum{}, errors.Errorf("common handle has %d columns, need offset %d", handle.NumCols(), handleOffset)
-		}
-		_, value, err := codec.DecodeOne(handle.EncodedCol(handleOffset))
-		if err != nil {
-			return types.Datum{}, err
-		}
-		return tablecodec.Unflatten(value, &column.FieldType, time.UTC)
-	}
-	if value, ok := rowMap[column.ID]; ok {
-		return value, nil
-	}
-	return tidbtable.GetColOriginDefaultValue(defaults, column)
+	return d.chunk.GetRow(0), nil
 }
 
 func packedVisibleColumns(table *model.TableInfo) []*model.ColumnInfo {
@@ -466,24 +406,6 @@ func samplePackedTableRanges(
 		sampled = append(sampled, ranges...)
 	}
 	return sampled, nil
-}
-
-func packedCommonHandleColumnOffsets(table *model.TableInfo) (map[int64]int, error) {
-	offsets := make(map[int64]int)
-	if !table.IsCommonHandle {
-		return offsets, nil
-	}
-	primary := table.GetPrimaryKey()
-	if primary == nil || !primary.Primary {
-		return nil, errors.Errorf("packed backup table %q has a common handle without a primary index", table.Name.O)
-	}
-	for handleOffset, indexColumn := range primary.Columns {
-		if indexColumn.Offset < 0 || indexColumn.Offset >= len(table.Columns) {
-			return nil, errors.Errorf("packed backup table %q has invalid primary column offset %d", table.Name.O, indexColumn.Offset)
-		}
-		offsets[table.Columns[indexColumn.Offset].ID] = handleOffset
-	}
-	return offsets, nil
 }
 
 func packedHashDataPrefix(hashKey []byte) kv.Key {
@@ -574,17 +496,14 @@ func packedCreateTableSQL(table *model.TableInfo) (string, error) {
 
 func (d *Dumper) dumpPacked() (resultErr error) {
 	started := time.Now()
-	defer func() {
-		d.metrics.observePackedPhase(packedPhaseExport, started, resultErr)
-	}()
 	dumper, err := startCSEDumper(
 		d.tctx,
 		d.conf.CSEExecutable,
 		d.conf.PackedBackup,
 		d.conf.CSELegacyEncryption,
 		d.conf.Threads,
-		d.metrics,
 	)
+	d.tctx.L().Info("packed CSE startup finished", zap.Duration("duration", time.Since(started)), zap.Error(err))
 	if err != nil {
 		return err
 	}

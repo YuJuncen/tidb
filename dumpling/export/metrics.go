@@ -4,7 +4,6 @@ package export
 
 import (
 	"math"
-	"time"
 
 	"github.com/pingcap/tidb/pkg/util/promutil"
 	"github.com/prometheus/client_golang/prometheus"
@@ -12,22 +11,13 @@ import (
 	"go.uber.org/atomic"
 )
 
-const (
-	packedPhaseCSEStart = "cse_start"
-	packedPhaseDecode   = "decode"
-	packedPhaseExport   = "export"
-	packedResultSuccess = "success"
-	packedResultError   = "error"
-)
-
 type metrics struct {
-	finishedSizeGauge            *prometheus.GaugeVec
-	finishedRowsGauge            *prometheus.GaugeVec
-	finishedTablesCounter        *prometheus.CounterVec
-	estimateTotalRowsCounter     *prometheus.CounterVec
-	errorCount                   *prometheus.CounterVec
-	taskChannelCapacity          *prometheus.GaugeVec
-	packedPhaseDurationHistogram *prometheus.HistogramVec
+	finishedSizeGauge        *prometheus.GaugeVec
+	finishedRowsGauge        *prometheus.GaugeVec
+	finishedTablesCounter    *prometheus.CounterVec
+	estimateTotalRowsCounter *prometheus.CounterVec
+	errorCount               *prometheus.CounterVec
+	taskChannelCapacity      *prometheus.GaugeVec
 	// todo: add these to metrics
 	totalChunks     atomic.Int64
 	completedChunks atomic.Int64
@@ -84,15 +74,6 @@ func newMetrics(f promutil.Factory, constLabels prometheus.Labels) *metrics {
 			Help:        "The task channel capacity during dumping progress",
 			ConstLabels: constLabels,
 		}, []string{})
-	m.packedPhaseDurationHistogram = f.NewHistogramVec(
-		prometheus.HistogramOpts{
-			Namespace:   "dumpling",
-			Subsystem:   "packed",
-			Name:        "phase_duration_seconds",
-			Help:        "Duration of Dumpling-owned packed export phases in seconds",
-			Buckets:     prometheus.ExponentialBuckets(0.00005, 2, 28),
-			ConstLabels: constLabels,
-		}, []string{"phase", "result"})
 	return &m
 }
 
@@ -103,7 +84,6 @@ func (m *metrics) registerTo(registry promutil.Registry) {
 	registry.MustRegister(m.finishedTablesCounter)
 	registry.MustRegister(m.errorCount)
 	registry.MustRegister(m.taskChannelCapacity)
-	registry.MustRegister(m.packedPhaseDurationHistogram)
 }
 
 func (m *metrics) unregisterFrom(registry promutil.Registry) {
@@ -113,18 +93,6 @@ func (m *metrics) unregisterFrom(registry promutil.Registry) {
 	registry.Unregister(m.finishedTablesCounter)
 	registry.Unregister(m.errorCount)
 	registry.Unregister(m.taskChannelCapacity)
-	registry.Unregister(m.packedPhaseDurationHistogram)
-}
-
-func (m *metrics) observePackedPhase(phase string, started time.Time, err error) {
-	if m == nil || m.packedPhaseDurationHistogram == nil {
-		return
-	}
-	result := packedResultSuccess
-	if err != nil {
-		result = packedResultError
-	}
-	m.packedPhaseDurationHistogram.WithLabelValues(phase, result).Observe(time.Since(started).Seconds())
 }
 
 // ReadCounter reports the current value of the counter.

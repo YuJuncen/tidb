@@ -78,12 +78,7 @@ func startCSEDumper(
 	executable, metadataURL string,
 	legacyEncryption bool,
 	threads int,
-	metrics *metrics,
-) (dumper *cseDumper, resultErr error) {
-	started := time.Now()
-	defer func() {
-		metrics.observePackedPhase(packedPhaseCSEStart, started, resultErr)
-	}()
+) (*cseDumper, error) {
 	temporary, err := os.MkdirTemp("", "dumpling-cse-")
 	if err != nil {
 		return nil, errors.Annotate(err, "create cse-ctl temporary directory")
